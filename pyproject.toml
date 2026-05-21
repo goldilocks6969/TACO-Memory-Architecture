@@ -1,0 +1,22 @@
+[project]
+name = "bubbles"
+version = "0.1.0"
+description = "State-Dependent Cognitive Orchestration: a memory + action layer for LLMs"
+requires-python = ">=3.9"
+dependencies = [
+    "psycopg[binary]>=3.1",
+    "pgvector>=0.2.5",
+    "openai>=1.30",
+    "numpy>=1.24",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+bubbles = "bubbles.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
