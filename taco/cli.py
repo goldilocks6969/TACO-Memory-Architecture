@@ -1,14 +1,14 @@
-"""Interactive REPL for talking to Bubbles, with introspection commands."""
+"""Interactive REPL for talking to Taco, with introspection commands."""
 from __future__ import annotations
 
 import argparse
 import sys
 
 from . import config, db
-from .pipeline import Bubbles
+from .pipeline import Taco
 
 BANNER = """\
-Bubbles — State-Dependent Cognitive Orchestration
+Taco AI OS — State-Dependent Cognitive Orchestration
   Type a message to talk. Commands:
     /state         show the latent state S = (E, K, V, R)
     /plan          show the six state-dependent subsystem decisions
@@ -22,7 +22,7 @@ Bubbles — State-Dependent Cognitive Orchestration
 def _print_turn(result) -> None:
     s = result.state
     gate = "STORED" if result.stored else "dropped"
-    print(f"\nbubbles> {result.response}")
+    print(f"\ntaco> {result.response}")
     print(
         f"  [S: E={s.E:.0f} K={s.K:.0f} V={s.V:.0f} R={s.R:.0f} | "
         f"salience {result.analysis['salience']:.1f} vs θ {result.plan.theta:.2f} "
@@ -34,7 +34,7 @@ def _print_turn(result) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Bubbles cognitive layer")
+    parser = argparse.ArgumentParser(description="Taco cognitive layer")
     parser.add_argument("--init", action="store_true",
                         help="create the schema then exit")
     args = parser.parse_args()
@@ -46,7 +46,7 @@ def main() -> None:
 
     db.init_db()  # idempotent — ensures tables exist
     conn = db.connect()
-    bubbles = Bubbles(conn)
+    taco = Taco(conn)
 
     mode = "MOCK" if (config.MOCK or not config.OPENAI_API_KEY) else config.LLM_MODEL
     print(BANNER)
@@ -65,7 +65,7 @@ def main() -> None:
         if line in ("/quit", "/exit"):
             break
         if line == "/state":
-            print(f"  {bubbles.state}")
+            print(f"  {taco.state}")
             continue
         if line == "/plan":
             if last:
@@ -86,14 +86,14 @@ def main() -> None:
         if line.startswith("/decay"):
             parts = line.split()
             weeks = float(parts[1]) if len(parts) > 1 else 0.0
-            report = bubbles.run_decay(extra_weeks=weeks)
+            report = taco.run_decay(extra_weeks=weeks)
             print(f"  decayed {report.decayed} episodes; "
                   f"abstracted {report.abstracted} into beliefs:")
             for b in report.beliefs:
                 print(f"    → {b}")
             continue
 
-        last = bubbles.turn(line)
+        last = taco.turn(line)
         _print_turn(last)
 
     conn.close()

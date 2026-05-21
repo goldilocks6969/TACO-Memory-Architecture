@@ -1,6 +1,6 @@
 """LLM-backed cognition: turn analysis, the reasoning response, and abstraction.
 
-Each function has a deterministic heuristic fallback (used when BUBBLES_MOCK=1
+Each function has a deterministic heuristic fallback (used when TACO_MOCK=1
 or no API key is present) so the whole architecture runs without external calls.
 """
 from __future__ import annotations

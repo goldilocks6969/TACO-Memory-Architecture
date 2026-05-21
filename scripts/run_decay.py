@@ -8,8 +8,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bubbles import db, embeddings, llm          # noqa: E402
-from bubbles.memory import decay                  # noqa: E402
+from taco import db, embeddings, llm             # noqa: E402
+from taco.memory import decay                     # noqa: E402
 
 
 def main() -> None:

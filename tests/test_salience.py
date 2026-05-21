@@ -1,7 +1,7 @@
 """Tests for the write-time salience gate and tier table (§4.1, §4.3, Fig 5)."""
-from bubbles import config
-from bubbles.memory import salience
-from bubbles.state import LatentState
+from taco import config
+from taco.memory import salience
+from taco.state import LatentState
 
 
 def test_tier_table_matches_paper():

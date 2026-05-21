@@ -3,7 +3,7 @@
 These validate the decay *math* (vitality = weekly_decay ** weeks) and the
 abstraction threshold without touching the database.
 """
-from bubbles import config
+from taco import config
 
 
 def vitality(weekly_decay: float, weeks: float) -> float:

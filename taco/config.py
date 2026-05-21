@@ -18,11 +18,11 @@ load_dotenv()
 # Runtime / providers
 # --------------------------------------------------------------------------- #
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-LLM_MODEL = os.getenv("BUBBLES_LLM_MODEL", "gpt-4o-mini")
-EMBED_MODEL = os.getenv("BUBBLES_EMBED_MODEL", "text-embedding-3-small")
+LLM_MODEL = os.getenv("TACO_LLM_MODEL", "gpt-4o-mini")
+EMBED_MODEL = os.getenv("TACO_EMBED_MODEL", "text-embedding-3-small")
 EMBED_DIM = 1536  # text-embedding-3-small
-PG_DSN = os.getenv("BUBBLES_PG_DSN", "postgresql://localhost:5432/bubbles")
-MOCK = os.getenv("BUBBLES_MOCK", "0") == "1"
+PG_DSN = os.getenv("TACO_PG_DSN", "postgresql://localhost:5432/taco")
+MOCK = os.getenv("TACO_MOCK", "0") == "1"
 
 
 # --------------------------------------------------------------------------- #

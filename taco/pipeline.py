@@ -38,7 +38,7 @@ class TurnResult:
     briefing: str
 
 
-class Bubbles:
+class Taco:
     """The cognitive layer. One instance per user/connection."""
 
     def __init__(self, conn: psycopg.Connection, working_window: int = 6):

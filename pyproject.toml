@@ -1,7 +1,7 @@
 [project]
-name = "bubbles"
+name = "taco-ai-os"
 version = "0.1.0"
-description = "State-Dependent Cognitive Orchestration: a memory + action layer for LLMs"
+description = "Taco AI OS — State-Dependent Cognitive Orchestration: a memory + action layer for LLMs"
 requires-python = ">=3.9"
 dependencies = [
     "psycopg[binary]>=3.1",
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-bubbles = "bubbles.cli:main"
+taco = "taco.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

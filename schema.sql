@@ -1,4 +1,4 @@
--- Bubbles schema. Maps the ten-layer cognitive stack (§3.2) to storage.
+-- Taco AI OS schema. Maps the ten-layer cognitive stack (§3.2) to storage.
 --   L1 Working Memory ....... transient, held in process (see pipeline.py)
 --   L2 Episodic Memory ...... episodes
 --   L3 Semantic Memory ...... semantic_beliefs

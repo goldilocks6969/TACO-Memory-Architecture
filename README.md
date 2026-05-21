@@ -1,4 +1,4 @@
-# Bubbles — State-Dependent Cognitive Orchestration
+# Taco AI OS — State-Dependent Cognitive Orchestration
 
 A memory + action layer that sits **between the user and an LLM**. A continuously
 inferred four-dimensional latent state `S = (E, K, V, R)` modulates not only the
@@ -8,7 +8,7 @@ timing, and reinforcement rate.
 
 This is a working implementation of the architecture in the whitepaper
 *"State-Dependent Cognitive Orchestration: A New Paradigm for AI Memory
-Architecture"* (Bubbles Research Note, May 2026). The LLM is never fine-tuned —
+Architecture"* (Research Note, May 2026). The LLM is never fine-tuned —
 it is the reasoning engine, and this layer is the prefrontal cortex around it.
 
 > The novel claim: in every other companion system, internal state is used for
@@ -28,20 +28,20 @@ Inferred every turn (never declared by the user), each dimension bounded `[0,100
 | `R` | Recency of contact | recent meaningful interaction | time (half-life) |
 
 `S` is read by every subsystem *before* it makes a decision. See
-[`bubbles/state.py`](bubbles/state.py).
+[`taco/state.py`](taco/state.py).
 
 ## The six state-dependent subsystems (§4)
 
 | # | Subsystem | Modulation | Code |
 |---|-----------|-----------|------|
-| 1 | **Salience gate** `θ(S)` | `θ ∈ [2.1, 4.3]`, falls with E/V → captures more in emotional moments | [`memory/salience.py`](bubbles/memory/salience.py) |
-| 2 | **Retrieval weights** `R(m)` | `w_emo(V) ∈ [0.20, 0.48]`; `w_rec` elevated in crisis | [`memory/retrieval.py`](bubbles/memory/retrieval.py) |
-| 3 | **Proactive initiation** | crisis + low recency → unprompted check-in | [`subsystems/proactive.py`](bubbles/subsystems/proactive.py) |
-| 4 | **Planning depth** | scales with engagement streak + trust (1→4 steps) | [`state.py`](bubbles/state.py) |
-| 5 | **Interruption timing** | high E+V → deliver within the hour; low → hold | [`state.py`](bubbles/state.py) |
-| 6 | **Reinforcement rate** | high V × high K → learn faster from moments that matter | [`state.py`](bubbles/state.py) |
+| 1 | **Salience gate** `θ(S)` | `θ ∈ [2.1, 4.3]`, falls with E/V → captures more in emotional moments | [`memory/salience.py`](taco/memory/salience.py) |
+| 2 | **Retrieval weights** `R(m)` | `w_emo(V) ∈ [0.20, 0.48]`; `w_rec` elevated in crisis | [`memory/retrieval.py`](taco/memory/retrieval.py) |
+| 3 | **Proactive initiation** | crisis + low recency → unprompted check-in | [`subsystems/proactive.py`](taco/subsystems/proactive.py) |
+| 4 | **Planning depth** | scales with engagement streak + trust (1→4 steps) | [`state.py`](taco/state.py) |
+| 5 | **Interruption timing** | high E+V → deliver within the hour; low → hold | [`state.py`](taco/state.py) |
+| 6 | **Reinforcement rate** | high V × high K → learn faster from moments that matter | [`state.py`](taco/state.py) |
 
-All six are resolved together by the [orchestrator](bubbles/subsystems/orchestrator.py).
+All six are resolved together by the [orchestrator](taco/subsystems/orchestrator.py).
 
 ## The retrieval scoring function
 
@@ -59,14 +59,14 @@ narrative briefing for a single LLM invocation (Figure 4).
 
 | Layer | Role | Where |
 |-------|------|-------|
-| L1 Working memory | short-term context window | in-process deque ([`pipeline.py`](bubbles/pipeline.py)) |
+| L1 Working memory | short-term context window | in-process deque ([`pipeline.py`](taco/pipeline.py)) |
 | L2 Episodic | event-based history | `episodes` table |
 | L3 Semantic | beliefs abstracted from decayed episodes | `semantic_beliefs` |
 | L4 Emotional | salience-weighted independent timeline | `emotional_timeline` |
 | L5 Procedural | learned workflows / habits | `procedural` |
 | L6 Reflective | self-generated abstractions | `reflections` |
 | L7 Reconsolidation | reads mutate traces (`last_access` touch) | acts on `episodes` |
-| L8 Forgetting | tier decay + abstraction-before-pruning | [`memory/decay.py`](bubbles/memory/decay.py) |
+| L8 Forgetting | tier decay + abstraction-before-pruning | [`memory/decay.py`](taco/memory/decay.py) |
 | L9 Predictive prefetch | anticipatory retrieval | (scaffolded) |
 | L10 Identity graph | persistent self-model | `identity` |
 
@@ -90,16 +90,16 @@ Requires Postgres + pgvector (already installed via Homebrew on this machine):
 
 ```bash
 brew services start postgresql@17        # if not already running
-createdb bubbles                          # if not already created
+createdb taco                             # if not already created
 python3 -m pip install --user -r requirements.txt
 cp .env.example .env                       # add your OPENAI_API_KEY
-python3 -m bubbles.cli --init             # create the schema
+python3 -m taco.cli --init             # create the schema
 ```
 
 ## Run
 
 ```bash
-python3 -m bubbles.cli                     # interactive REPL
+python3 -m taco.cli                     # interactive REPL
 ```
 
 In the REPL: `/state`, `/plan`, `/mem`, `/why`, `/decay [weeks]`, `/quit`.
@@ -107,7 +107,7 @@ In the REPL: `/state`, `/plan`, `/mem`, `/why`, `/decay [weeks]`, `/quit`.
 **No API key?** Run with deterministic heuristics instead of OpenAI:
 
 ```bash
-BUBBLES_MOCK=1 python3 -m bubbles.cli
+TACO_MOCK=1 python3 -m taco.cli
 ```
 
 The weekly forgetting job (for cron):
@@ -129,7 +129,7 @@ the tier decay schedule against the paper's stated values.
 ## Project layout
 
 ```
-bubbles/
+taco/
   config.py            every constant from the paper (tiers, weights, endpoints)
   state.py             S=(E,K,V,R), inference, and all S→parameter curves
   db.py                Postgres + pgvector connection

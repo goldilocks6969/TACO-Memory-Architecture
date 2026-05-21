@@ -1,8 +1,8 @@
 """Tests for the latent state and its modulation curves (§3.1, §4)."""
 import math
 
-from bubbles import config
-from bubbles.state import ContentSignal, LatentState, infer_state, recency_score
+from taco import config
+from taco.state import ContentSignal, LatentState, infer_state, recency_score
 
 
 def test_theta_endpoints():

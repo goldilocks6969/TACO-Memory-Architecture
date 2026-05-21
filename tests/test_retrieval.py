@@ -1,10 +1,10 @@
 """Tests for R(m) scoring and re-ranking (§4.2, Figure 4)."""
 from datetime import datetime, timedelta, timezone
 
-from bubbles import config
-from bubbles.memory import retrieval
-from bubbles.memory.episode import Episode
-from bubbles.state import LatentState
+from taco import config
+from taco.memory import retrieval
+from taco.memory.episode import Episode
+from taco.state import LatentState
 
 
 def _ep(**kw) -> Episode:
