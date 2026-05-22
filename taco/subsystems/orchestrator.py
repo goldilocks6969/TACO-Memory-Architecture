@@ -9,13 +9,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict
 
-from . import proactive
+from . import proactive, reasoning
 from ..state import LatentState
 
 
 @dataclass
 class CognitivePlan:
-    """All six state-dependent decisions for a single turn."""
+    """All state-dependent decisions for a single turn (the six subsystems plus
+    the memory-conditioned reasoning stance that conditions the engine itself)."""
 
     # 1. write-time salience gate
     theta: float
@@ -29,6 +30,8 @@ class CognitivePlan:
     interruption: str
     # 6. reinforcement weighting
     reinforcement_rate: float
+    # 7. memory-conditioned reasoning stance (how the engine treats the memories)
+    stance: reasoning.ReasoningStance
 
     def summary(self) -> str:
         w = " ".join(f"{k}={v:.2f}" for k, v in self.weights.items())
@@ -37,7 +40,9 @@ class CognitivePlan:
             f"interrupt={self.interruption} | reinforce×{self.reinforcement_rate:.2f}\n"
             f"  weights: {w}\n"
             f"  proactive: {self.proactive.kind} "
-            f"({'yes' if self.proactive.initiate else 'no'}) — {self.proactive.reason}"
+            f"({'yes' if self.proactive.initiate else 'no'}) — {self.proactive.reason}\n"
+            f"  stance: {self.stance.mode}"
+            f"{' (continuity > similarity)' if self.stance.continuity_over_similarity else ''}"
         )
 
 
@@ -51,4 +56,5 @@ def plan(state: LatentState,
         planning_depth=state.planning_depth(),
         interruption=state.interruption_policy(),
         reinforcement_rate=state.reinforcement_rate(),
+        stance=reasoning.stance(state),
     )

@@ -23,14 +23,23 @@ def _print_turn(result) -> None:
     s = result.state
     gate = "STORED" if result.stored else "dropped"
     print(f"\ntaco> {result.response}")
+    st = result.plan.stance
     print(
         f"  [S: E={s.E:.0f} K={s.K:.0f} V={s.V:.0f} R={s.R:.0f} | "
         f"salience {result.analysis['salience']:.1f} vs θ {result.plan.theta:.2f} "
-        f"→ {gate} | tone {result.analysis['tone']}]"
+        f"→ {gate} | tone {result.analysis['tone']} | stance {st.mode}"
+        f"{'*' if st.continuity_over_similarity else ''}]"
     )
     if result.plan.proactive.initiate:
         p = result.plan.proactive
         print(f"  [proactive: would {p.kind} — {p.reason}]")
+    if result.reconsolidated:
+        print(f"  [reconsolidated {result.reconsolidated} memory(s) — meaning evolved]")
+    for u in result.identity_updates:
+        verb = "revised" if u.changed else "reinforced"
+        print(f"  [identity {verb}: {u.attribute} = {u.value} ({u.confidence:.0%})]")
+    if result.prediction and result.prediction.trend != "stable":
+        print(f"  [predict: {result.prediction.trend}]")
 
 
 def main() -> None:

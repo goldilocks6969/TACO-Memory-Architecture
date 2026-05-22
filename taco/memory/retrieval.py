@@ -9,11 +9,15 @@ R(m), selects the top 4, and assembles them into a single narrative briefing.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 from .episode import Episode
 from .. import config
 from ..state import LatentState
+
+if TYPE_CHECKING:  # avoids a runtime memory→subsystems import; duck-typed below
+    from ..subsystems.reasoning import ReasoningStance
+    from ..subsystems.prediction import PredictiveContinuity
 
 
 # --------------------------------------------------------------------------- #
@@ -80,19 +84,26 @@ def rerank(candidates: List[Episode], state: LatentState,
 # Context assembly (Figure 4 step 4)
 # --------------------------------------------------------------------------- #
 def assemble_briefing(memories: List[Episode], beliefs: List[str],
-                      working: List[Episode], state: LatentState) -> str:
+                      working: List[Episode], state: LatentState,
+                      stance: Optional["ReasoningStance"] = None,
+                      identity: Optional[List[str]] = None,
+                      prediction: Optional["PredictiveContinuity"] = None) -> str:
     """Assemble the structured narrative briefing for the single LLM call.
 
     This is the prompt fragment the reasoning engine sees — not raw top-k
-    passages, but a state-aware narrative of who it is talking to and what is
-    most relevant right now.
+    passages, but a state-aware narrative of who it is talking to, what is most
+    relevant right now, and (via the reasoning `stance`) *how to reason about it*.
+    The stance is what makes this memory-conditioned rather than memory-augmented:
+    it frames the memories as cognitively privileged and shifts the reasoning
+    rules with the user's state.
     """
     lines: List[str] = []
     lines.append(
         "You are the reasoning engine inside a state-dependent cognitive memory "
         "layer. A separate system has inferred the user's current state and "
-        "selected the most relevant memories. Respond naturally; let the state "
-        "and memories shape both what you say and what you choose to do."
+        "selected the most relevant memories. Respond naturally; let the state, "
+        "the memories, and the reasoning directives below shape both what you say "
+        "and what you choose to do."
     )
     lines.append("")
     lines.append(
@@ -101,15 +112,31 @@ def assemble_briefing(memories: List[Episode], beliefs: List[str],
         f"{state.R:.0f}/100 (current tone: {state_tone(state)})."
     )
 
+    # The memory-conditioned reasoning stance — placed before the memories so the
+    # engine reads *how* to weigh them before it reads them.
+    if stance is not None:
+        lines.append("")
+        lines.append(stance.render())
+
+    # L10: the persistent self-model — the most durable layer, asserted first.
+    if identity:
+        lines.append("")
+        lines.append("Persistent self-model (who this person is, across time):")
+        for fact in identity:
+            lines.append(f"  • {fact}")
+
     if beliefs:
         lines.append("")
-        lines.append("What you durably believe about this person:")
+        lines.append("Durable, identity-level beliefs about this person:")
         for b in beliefs:
             lines.append(f"  • {b}")
 
     if memories:
         lines.append("")
-        lines.append("Most relevant remembered episodes (re-ranked by R(m)):")
+        lines.append(
+            "Psychologically privileged memories (re-ranked by R(m), most "
+            "significant first):"
+        )
         for m in memories:
             lines.append(
                 f"  • [{m.tone or 'neutral'}, salience {m.salience:.0f}/10, "
@@ -121,5 +148,11 @@ def assemble_briefing(memories: List[Episode], beliefs: List[str],
         lines.append("Recent conversation (working memory):")
         for w in working:
             lines.append(f"  {w.role}: {w.content}")
+
+    # L9: where this is heading — lets the engine get ahead of the user.
+    if prediction is not None:
+        lines.append("")
+        lines.append("Predictive continuity (anticipatory, not yet stated):")
+        lines.append(prediction.render())
 
     return "\n".join(lines)

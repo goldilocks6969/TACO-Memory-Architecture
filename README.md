@@ -43,6 +43,32 @@ Inferred every turn (never declared by the user), each dimension bounded `[0,100
 
 All six are resolved together by the [orchestrator](taco/subsystems/orchestrator.py).
 
+### 7. Memory-conditioned reasoning — the reasoning stance
+
+The six subsystems decide *what* is stored, *what* is retrieved, *when* to act,
+and *how deep* to plan. None of them change how the reasoning engine **treats**
+the memories once they are in hand — by default an LLM reads them as ordinary
+extra context. That is the difference between *smart retrieval* and a
+*state-conditioned reasoning architecture*, and it is closed by a seventh
+decision the orchestrator resolves from `S`: the **reasoning stance**
+([`subsystems/reasoning.py`](taco/subsystems/reasoning.py)).
+
+The stance is injected into the briefing *before* the memories, framing them as
+**psychologically privileged information** and shifting the reasoning rules with
+state. The same retrieved set is reasoned about differently:
+
+| Stance | Region of `S` | Reasoning rule |
+|--------|---------------|----------------|
+| `distress` / `crisis` | high `E` | continuity **over** semantic similarity; connect identity beliefs to the present; maintain longitudinal coherence |
+| `vulnerable` | high `V` | lead with emotional resonance; reference specific shared history gently |
+| `concerned` | moderate `E` | weave history in; watch for escalation |
+| `engaged` | high `K` | reason *across* the relationship; build on open threads, anticipate |
+| `transactional` | low `E`,`V`,`K` | memories are factual reference only; don't force continuity |
+
+> The LLM is still never fine-tuned. The stance makes the *reasoning engine
+> itself* state-dependent — the same model, told to weigh the same memories
+> differently depending on who it is talking to and how they are right now.
+
 ## The retrieval scoring function
 
 ```
@@ -65,10 +91,10 @@ narrative briefing for a single LLM invocation (Figure 4).
 | L4 Emotional | salience-weighted independent timeline | `emotional_timeline` |
 | L5 Procedural | learned workflows / habits | `procedural` |
 | L6 Reflective | self-generated abstractions | `reflections` |
-| L7 Reconsolidation | reads mutate traces (`last_access` touch) | acts on `episodes` |
+| L7 Reconsolidation | re-remembering rewrites meaning + attenuates charge | [`memory/reconsolidation.py`](taco/memory/reconsolidation.py) |
 | L8 Forgetting | tier decay + abstraction-before-pruning | [`memory/decay.py`](taco/memory/decay.py) |
-| L9 Predictive prefetch | anticipatory retrieval | (scaffolded) |
-| L10 Identity graph | persistent self-model | `identity` |
+| L9 Predictive prefetch | trajectory projection + anticipatory retrieval | [`subsystems/prediction.py`](taco/subsystems/prediction.py) |
+| L10 Identity graph | persistent self-model, confidence-weighted | [`memory/identity.py`](taco/memory/identity.py) |
 
 ## Memory decay (§4.4, Figure 6)
 
@@ -83,6 +109,44 @@ belief, then pruned** — meaning survives, detail is forgotten.
 | 5–6 | plans · moderate stress | ×0.88 |
 | 3–4 | light personal sharing | ×0.75 |
 | 1–2 | greetings · small talk | ×0.60 (pruned in days) |
+
+## Memory that evolves: identity, reconsolidation, prediction
+
+The layers above make retrieval *state-aware*. These three make memory itself
+**alive** — it consolidates into a self-model, rewrites itself on recall, and
+reaches forward in time. All three are wired into every `turn()` and run keyless
+(heuristic fallbacks) or LLM-backed.
+
+**L10 — Identity abstraction (the self-model).** Episodes are isolated events;
+identity is *who the person is across time*. From significant moments (tier 5+),
+TACO extracts durable facts — relationships, roles, values, ongoing struggles —
+into the `identity` graph. Repeated, consistent evidence raises confidence
+asymptotically toward 1.0; contradicting evidence triggers **belief revision**
+(`identity.reconcile`). The confident self-model is asserted at the top of every
+briefing, so the engine reasons from a stable picture of the person, not just the
+last few messages.
+
+**L7 — Reconsolidation (memory rewrites itself).** Humans don't replay static
+memories; recall re-encodes them in the present state. When a memory encoded in a
+hot state (`s_e ≥ 55`) is retrieved while the user is now substantially calmer
+(`ΔE ≥ 30`), TACO **reconsolidates** it: the semantic abstraction is rewritten
+toward an integrated belief (*"I failed"* → *"that failure made me stronger"*),
+the emotional charge attenuates on the L4 timeline (`×0.6`), and the trace is
+timestamped (cooldown-gated, bounded to one rewrite/turn). The event is never
+altered — only its meaning and weight.
+
+**L9 — Predictive continuity (memory reaches forward).** Reactive subsystems read
+the *current* `S`; this one reads its *trajectory*. It extrapolates the next state
+from the recent state log (damped, bounded), classifies the trend
+(`escalating` / `recovering` / `stable`), and surfaces **emergent themes** —
+tones recurring across recent significant episodes, i.e. what is likely to become
+persistent. When the trajectory is escalating, it issues a state-gated
+**anticipatory prefetch** so the right memory is already in hand before the need
+is spoken.
+
+> Net effect: identical retrieval is no longer the ceiling. The same model now
+> reasons from a persistent identity, watches memories *change* as the user
+> changes, and gets ahead of where they're heading.
 
 ## Setup
 

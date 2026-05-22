@@ -22,6 +22,11 @@ class Episode:
     last_access: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     id: Optional[int] = None
 
+    # snapshot of the state S at encoding + L7 bookkeeping (used by reconsolidation)
+    s_e: Optional[float] = None       # emotional intensity when this was encoded
+    s_v: Optional[float] = None       # vulnerability when this was encoded
+    reconsolidated_at: Optional[datetime] = None
+
     # transient, populated during retrieval (not persisted)
     similarity: float = 0.0   # cosine sim from the kNN cast, in [0,1]
     score: float = 0.0        # final R(m) after re-ranking

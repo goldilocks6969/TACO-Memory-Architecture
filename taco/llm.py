@@ -149,11 +149,47 @@ def respond(system_brief: str, user_message: str, planning_depth: int) -> str:
     return resp.choices[0].message.content.strip()
 
 
+def _stance_mode(system_brief: str) -> str:
+    m = re.search(r"\[stance:\s*([a-z]+)\]", system_brief)
+    return m.group(1) if m else "neutral"
+
+
+def _top_memory(system_brief: str) -> str:
+    """Pull the most privileged remembered episode out of the briefing block.
+
+    Lets the keyless mock actually *demonstrate* memory-conditioned recall (and
+    makes the continuity benchmark reflect retrieval quality, not just plumbing).
+    """
+    in_block = False
+    for line in system_brief.splitlines():
+        if line.startswith("Psychologically privileged memories"):
+            in_block = True
+            continue
+        if in_block:
+            stripped = line.strip()
+            if stripped.startswith("•"):
+                # strip the "• [tone, salience N/10, R=x] " metadata prefix
+                return re.sub(r"^•\s*\[[^\]]*\]\s*", "", stripped).strip()
+            if stripped == "":
+                break
+    return ""
+
+
 def _mock_respond(system_brief: str, user_message: str, planning_depth: int) -> str:
     plan = "" if planning_depth <= 1 else f" [planning {planning_depth} steps ahead]"
+    mode = _stance_mode(system_brief)
+    mem = _top_memory(system_brief)
+    # In privileged stances the mock leads with continuity; in transactional ones
+    # it stays terse and only uses memory if it surfaced — mirroring the directives.
+    if mem and mode in ("distress", "crisis", "vulnerable", "concerned"):
+        recall = f" Staying with what matters: {mem}"
+    elif mem:
+        recall = f" For reference: {mem}"
+    else:
+        recall = ""
     return (
-        f"(mock reasoning engine{plan}) I hear you. "
-        f"Given what I remember, here's my response to: \"{user_message[:80]}\""
+        f"(mock reasoning engine, stance={mode}{plan}) I hear you.{recall} "
+        f"Here's my response to: \"{user_message[:80]}\""
     )
 
 
@@ -176,3 +212,108 @@ def abstract(texts: List[str]) -> str:
         temperature=0.3,
     ))
     return resp.choices[0].message.content.strip()
+
+
+# --------------------------------------------------------------------------- #
+# L10 — identity extraction (the persistent self-model)
+# --------------------------------------------------------------------------- #
+_REL_ROLES = (
+    "partner", "wife", "husband", "girlfriend", "boyfriend", "fiancé", "fiancee",
+    "mother", "mom", "father", "dad", "son", "daughter", "sister", "brother",
+    "friend", "boss", "manager", "therapist", "doctor", "roommate",
+)
+
+
+def _heuristic_identity(text: str) -> List[Dict]:
+    """Cheap, deterministic identity extraction for the keyless path.
+
+    Pulls named relationships ("my partner Maya") and a coarse occupation. The
+    real LLM extractor below generalises well beyond these patterns.
+    """
+    out: List[Dict] = []
+    roles = "|".join(_REL_ROLES)
+    for m in re.finditer(rf"\bmy ({roles})(?:[, ]+(?:named|called)\s+)?\s+([A-Z][a-z]+)", text):
+        out.append({"attribute": f"relationship:{m.group(1).lower()}",
+                    "value": m.group(2), "confidence": 0.6})
+    job = re.search(r"\bI(?:'m| am)? (?:a|an) ([a-z]+(?: [a-z]+)?)\b", text)
+    if job and job.group(1) not in ("bit", "little", "lot", "few"):
+        out.append({"attribute": "occupation", "value": job.group(1), "confidence": 0.5})
+    return out
+
+
+def extract_identity(text: str, existing: List[tuple] | None = None) -> List[Dict]:
+    """Return durable identity facts [{attribute, value, confidence}] from a turn.
+
+    `existing` is the current self-model (attribute, value, confidence) so the
+    model can revise rather than duplicate. Identity = who the person *is* across
+    time (values, relationships, ongoing struggles), not transient events.
+    """
+    if config.MOCK or not config.OPENAI_API_KEY:
+        return _heuristic_identity(text)
+
+    known = "; ".join(f"{a}={v}" for a, v, _ in (existing or [])) or "(none yet)"
+    sys = (
+        "You maintain a persistent self-model of a user. From the message, extract "
+        "ONLY durable, identity-level facts — relationships, values, roles, ongoing "
+        "struggles, stable preferences — not transient events or moods. Revise "
+        "existing facts instead of duplicating them. Respond with strict JSON: "
+        '{"facts": [{"attribute": "<stable kebab/colon key>", "value": "<short>", '
+        '"confidence": <0-1>}]}. Return an empty list if nothing identity-level is present.'
+    )
+    try:
+        resp = with_retries(lambda: _client().chat.completions.create(
+            model=config.LLM_MODEL,
+            messages=[{"role": "system", "content": sys},
+                      {"role": "user", "content": f"KNOWN: {known}\nMESSAGE: {text}"}],
+            temperature=0,
+            response_format={"type": "json_object"},
+        ))
+        facts = json.loads(resp.choices[0].message.content).get("facts", [])
+        clean: List[Dict] = []
+        for f in facts:
+            if f.get("attribute") and f.get("value"):
+                clean.append({
+                    "attribute": str(f["attribute"])[:64],
+                    "value": str(f["value"])[:120],
+                    "confidence": max(0.0, min(1.0, float(f.get("confidence", 0.5)))),
+                })
+        return clean
+    except Exception:
+        return _heuristic_identity(text)
+
+
+# --------------------------------------------------------------------------- #
+# L7 — reconsolidation (a re-remembered memory is rewritten)
+# --------------------------------------------------------------------------- #
+def reconsolidate(original: str, original_tone: str, current_tone: str) -> str:
+    """Rewrite a memory's meaning when it is re-experienced from a changed state.
+
+    The event is unchanged; its *abstraction* integrates the new perspective —
+    e.g. an episode encoded in distress, revisited from calm, becomes a belief
+    about growth rather than a raw wound (§4.3, L7)."""
+    if config.MOCK or not config.OPENAI_API_KEY:
+        stem = original.strip().rstrip(".")
+        return (f"This person has integrated an earlier {original_tone or 'difficult'} "
+                f"experience — \"{stem[:120]}\" — and now holds it from a "
+                f"{current_tone or 'steadier'} place.")
+
+    sys = (
+        "A memory is being recalled from a changed emotional state — this is "
+        "reconsolidation: the event stays fixed but its meaning evolves. Given the "
+        "ORIGINAL memory (and the tone it was encoded in) and the user's CURRENT "
+        "tone, write ONE present-tense belief that integrates the original "
+        "experience with the new perspective. Start with 'This person'."
+    )
+    try:
+        resp = with_retries(lambda: _client().chat.completions.create(
+            model=config.LLM_MODEL,
+            messages=[{"role": "system", "content": sys},
+                      {"role": "user", "content": (
+                          f"ORIGINAL (tone={original_tone}): {original}\n"
+                          f"CURRENT tone: {current_tone}")}],
+            temperature=0.4,
+        ))
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        stem = original.strip().rstrip(".")
+        return f"This person has reframed \"{stem[:120]}\" from a {current_tone} place."

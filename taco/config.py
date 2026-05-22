@@ -95,6 +95,34 @@ ABSTRACTION_THRESHOLD = 0.15  # §4.4 — below this vitality, abstract then pru
 INITIAL_VITALITY = 1.0
 
 
+# --------------------------------------------------------------------------- #
+# L10 identity abstraction — the persistent self-model
+# --------------------------------------------------------------------------- #
+IDENTITY_SALIENCE_MIN = 5.0   # consolidate identity from tier-5+ moments
+                              # (Fig 5: "revealed preferences" upward), not chatter
+IDENTITY_CONF_REINFORCE = 0.30  # repeated, consistent evidence raises confidence
+IDENTITY_TOP_K = 6            # attributes surfaced in the briefing
+IDENTITY_MIN_CONFIDENCE = 0.4  # below this an attribute is too weak to assert
+
+
+# --------------------------------------------------------------------------- #
+# L7 reconsolidation — a re-remembered memory is rewritten
+# --------------------------------------------------------------------------- #
+RECON_ENCODED_E_MIN = 55.0    # memory must have been encoded hot to be eligible
+RECON_DROP_MIN = 30.0         # current E must be this far below the encoded E
+RECON_COOLDOWN_DAYS = 7.0     # don't re-write the same trace more often than this
+RECON_ATTENUATION = 0.6       # emotional charge retained after integration
+RECON_MAX_PER_TURN = 1        # bound the extra cognition per turn
+
+
+# --------------------------------------------------------------------------- #
+# L9 predictive continuity — anticipatory state + prefetch
+# --------------------------------------------------------------------------- #
+PREDICT_HISTORY = 8           # states of trajectory used for extrapolation
+PREDICT_DAMPING = 0.6         # how much of the observed trend carries forward
+PREFETCH_K = 2                # anticipatory candidates merged into retrieval
+
+
 def tier_for_score(score: float) -> SalienceTier:
     """Return the salience tier a 1–10 score falls into."""
     s = max(1, min(10, round(score)))
