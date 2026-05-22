@@ -103,6 +103,30 @@ class Taco:
                           briefing=briefing)
 
     # ------------------------------------------------------------------ #
+    def probe(self, user_message: str) -> TurnResult:
+        """Read-only turn: infer state and retrieve/respond WITHOUT writing back.
+
+        Used for evaluation so probes don't contaminate memory or each other. The
+        probe's own affect still transiently shapes S (state modulates retrieval),
+        but nothing is persisted.
+        """
+        analysis = llm.analyze(user_message)
+        signal = ContentSignal(emotional=analysis["emotional"],
+                               vulnerability=analysis["vulnerability"])
+        state = infer_state(self.state, signal, 0.5)  # transient, not persisted
+        plan = orchestrator.plan(state)
+
+        q_emb = embeddings.embed_list(user_message)
+        candidates = store.knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
+        top = retrieval.rerank(candidates, state, top_k=config.TOP_K)
+        beliefs = store.belief_candidates(self.conn, q_emb, k=2)
+        briefing = retrieval.assemble_briefing(top, beliefs, list(self.working), state)
+        response = llm.respond(briefing, user_message, plan.planning_depth)
+
+        return TurnResult(response=response, state=state, plan=plan,
+                          analysis=analysis, retrieved=top, stored=False,
+                          briefing=briefing)
+
     def run_decay(self, extra_weeks: float = 0.0) -> decay.DecayReport:
         """Run the forgetting engine (tier decay + abstraction-before-pruning)."""
         return decay.run(self.conn, embeddings.embed_list, llm.abstract,

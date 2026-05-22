@@ -10,6 +10,7 @@ import re
 from typing import Dict, List
 
 from . import config
+from .retry import with_retries
 
 # --------------------------------------------------------------------------- #
 # Heuristic lexicons for the keyless fallback (and rule-based mode, §3.1)
@@ -95,7 +96,7 @@ def _heuristic_analyze(text: str) -> Dict:
 def _client():
     from openai import OpenAI
 
-    return OpenAI(api_key=config.OPENAI_API_KEY)
+    return OpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
 
 
 def analyze(text: str) -> Dict:
@@ -118,13 +119,13 @@ def analyze(text: str) -> Dict:
         "remembering long-term this is (10 = breakup/death/identity revelation, "
         "1 = greeting/small talk). tone = a single lowercase word."
     )
-    resp = _client().chat.completions.create(
+    resp = with_retries(lambda: _client().chat.completions.create(
         model=config.LLM_MODEL,
         messages=[{"role": "system", "content": sys},
                   {"role": "user", "content": text}],
         temperature=0,
         response_format={"type": "json_object"},
-    )
+    ))
     data = json.loads(resp.choices[0].message.content)
     return {
         "emotional": float(data.get("emotional", 0)),
@@ -139,12 +140,12 @@ def respond(system_brief: str, user_message: str, planning_depth: int) -> str:
     if config.MOCK or not config.OPENAI_API_KEY:
         return _mock_respond(system_brief, user_message, planning_depth)
 
-    resp = _client().chat.completions.create(
+    resp = with_retries(lambda: _client().chat.completions.create(
         model=config.LLM_MODEL,
         messages=[{"role": "system", "content": system_brief},
                   {"role": "user", "content": user_message}],
         temperature=0.7,
-    )
+    ))
     return resp.choices[0].message.content.strip()
 
 
@@ -168,10 +169,10 @@ def abstract(texts: List[str]) -> str:
         "events are forgotten. One sentence, present tense, starts with 'This "
         "person'."
     )
-    resp = _client().chat.completions.create(
+    resp = with_retries(lambda: _client().chat.completions.create(
         model=config.LLM_MODEL,
         messages=[{"role": "system", "content": sys},
                   {"role": "user", "content": "\n".join(f"- {t}" for t in texts)}],
         temperature=0.3,
-    )
+    ))
     return resp.choices[0].message.content.strip()

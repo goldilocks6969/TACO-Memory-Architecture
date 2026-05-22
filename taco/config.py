@@ -18,8 +18,24 @@ load_dotenv()
 # Runtime / providers
 # --------------------------------------------------------------------------- #
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-LLM_MODEL = os.getenv("TACO_LLM_MODEL", "gpt-4o-mini")
-EMBED_MODEL = os.getenv("TACO_EMBED_MODEL", "text-embedding-3-small")
+# Optional custom / OpenAI-compatible endpoint (Azure, proxy, vLLM, etc.)
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "") or None
+
+# Embeddings may use a SEPARATE provider from chat (e.g. chat on Azure,
+# embeddings on OpenAI). Falls back to the chat credentials if not set; an empty
+# EMBED_BASE_URL means standard api.openai.com.
+EMBED_API_KEY = os.getenv("EMBED_API_KEY", "") or OPENAI_API_KEY
+EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", "") or None
+
+# Azure OpenAI embeddings (classic deployment-routed data-plane API). When set,
+# embeddings go to {endpoint}/openai/deployments/{EMBED_MODEL}/embeddings.
+AZURE_EMBED_ENDPOINT = os.getenv("AZURE_EMBED_ENDPOINT", "") or None
+AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-10-21")
+# The single base LLM + embedding model. Used IDENTICALLY by both the vanilla
+# RAG baseline and the Taco layer — Taco never swaps the model, it only changes
+# what context is assembled around it.
+LLM_MODEL = os.getenv("BASE_LLM_MODEL", "gpt-4o-mini")
+EMBED_MODEL = os.getenv("BASE_EMBED_MODEL", "text-embedding-3-small")
 EMBED_DIM = 1536  # text-embedding-3-small
 PG_DSN = os.getenv("TACO_PG_DSN", "postgresql://localhost:5432/taco")
 MOCK = os.getenv("TACO_MOCK", "0") == "1"
