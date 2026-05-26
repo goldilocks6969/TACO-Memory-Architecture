@@ -10,6 +10,7 @@
 -- being tables themselves; L9 (predictive prefetch) reads them.
 
 CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;   -- trigram (BM25-ish) matching for facts
 
 -- L2: event-based autobiographical history. Each row is one stored episode.
 CREATE TABLE IF NOT EXISTS episodes (
@@ -34,6 +35,67 @@ CREATE TABLE IF NOT EXISTS episodes (
 CREATE INDEX IF NOT EXISTS episodes_embedding_idx
     ON episodes USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS episodes_vitality_idx ON episodes (vitality);
+
+-- Structured FACTS — the retrieval target (Phase 1). Episodes stay the raw
+-- conversational record (feeding the L4 emotional timeline and L7
+-- reconsolidation); facts are extracted, deduplicated, paraphrase-retrievable
+-- units. Several columns (emotional_cause, user_belief, retrieval_cues) are
+-- TACO-specific and have no Mem0 equivalent.
+CREATE TABLE IF NOT EXISTS facts (
+    id            BIGSERIAL PRIMARY KEY,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Core content
+    summary       TEXT NOT NULL,        -- "User's father died of a heart attack last month"
+    embedding     vector(1536),         -- text-embedding-3-small for now; Phase 9 → bge-large(1024)
+
+    -- Classification
+    event_type    TEXT,                 -- conflict|goal|preference|fear|plan|relationship
+                                        -- |achievement|failure|health|money|identity|thread
+    fact_type     TEXT,                 -- 'preference'|'event'|'relationship'|'state'|'thread'
+
+    -- Emotional signal (TACO-specific, not in Mem0)
+    emotional_tone   TEXT,              -- 'distress' | 'tender' | 'concerned' | ...
+    emotional_cause  TEXT,              -- "fear of failing the interview again"
+    user_belief      TEXT,              -- "I mess up important opportunities"
+    salience         REAL NOT NULL,
+
+    -- Retrieval expansion (cheap recall booster, used by Phase 2 hybrid retrieval)
+    retrieval_cues   TEXT[],            -- alt phrasings: ["interview anxiety","fear of failure"]
+    cues_text        TEXT,              -- retrieval_cues joined; kept in sync by the app
+                                        -- (array_to_string isn't IMMUTABLE, so we can't
+                                        -- index the array directly — denormalize instead)
+
+    -- Entity graph (Phase 2)
+    entity_keys      TEXT[],            -- ["person:maya", "role:interview"]
+
+    -- Temporal validity (Phase 5)
+    valid_from       TIMESTAMPTZ,       -- when the fact became true
+    valid_until      TIMESTAMPTZ,       -- null = currently true
+
+    -- Lineage
+    source_episode_ids BIGINT[],        -- episodes this fact was drawn from
+    superseded_by      BIGINT REFERENCES facts(id),
+
+    -- Status: 'current' | 'outdated' | 'uncertain' | 'resolved'
+    validity      TEXT NOT NULL DEFAULT 'current',
+
+    -- Open-thread tracking (when fact_type = 'thread')
+    thread_status TEXT,                 -- 'unresolved' | 'in_progress' | 'resolved'
+    due_date      TIMESTAMPTZ,
+
+    -- Decay
+    vitality      REAL NOT NULL DEFAULT 1.0,
+    confidence    REAL NOT NULL DEFAULT 0.7
+);
+CREATE INDEX IF NOT EXISTS facts_embedding_idx
+    ON facts USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS facts_entity_idx ON facts USING gin (entity_keys);
+CREATE INDEX IF NOT EXISTS facts_summary_trgm ON facts USING gin (summary gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS facts_cues_trgm ON facts USING gin (cues_text gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS facts_validity_idx ON facts (validity, valid_until);
+CREATE INDEX IF NOT EXISTS facts_threads_idx ON facts (thread_status) WHERE fact_type = 'thread';
 
 -- L3: beliefs abstracted from decayed episodes (meaning outlives the event).
 CREATE TABLE IF NOT EXISTS semantic_beliefs (

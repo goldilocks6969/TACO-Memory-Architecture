@@ -45,16 +45,29 @@ _RUBRIC = (
 
 
 def judge(probe_text: str, ground_truth: str, kind: str, response: str) -> Dict:
-    if config.MOCK or not config.OPENAI_API_KEY:
-        return {"score": _mock_score(response, ground_truth), "reason": "mock"}
-
-    from taco.llm import _client
-    from taco.retry import with_retries
-
+    """Score a response. Always returns ``input_text`` / ``output_text`` (the raw
+    prompt and the raw judge reply) so the eval harness can charge judge tokens.
+    """
     user = (
         f"PROBE: {probe_text}\nGROUND TRUTH: {ground_truth}\n"
         f"PROBE KIND: {kind}\nRESPONSE: {response}"
     )
+    input_text = _RUBRIC + "\n" + user
+
+    if config.MOCK:
+        score = _mock_score(response, ground_truth)
+        return {"score": score, "reason": "mock",
+                "input_text": input_text,
+                "output_text": json.dumps({"score": score, "reason": "mock"})}
+    if not config.OPENAI_API_KEY:
+        raise RuntimeError(
+            "No API key configured — set OPENAI_API_KEY or TACO_MOCK=1 explicitly"
+        )
+
+    from taco.llm import _client
+    from taco.retry import with_retries
+
+    raw_output = ""
     try:
         resp = with_retries(lambda: _client().chat.completions.create(
             model=config.LLM_MODEL,
@@ -63,9 +76,13 @@ def judge(probe_text: str, ground_truth: str, kind: str, response: str) -> Dict:
             temperature=0,
             response_format={"type": "json_object"},
         ))
-        data = json.loads(resp.choices[0].message.content)
+        raw_output = resp.choices[0].message.content
+        data = json.loads(raw_output)
         score = int(max(0, min(100, float(data.get("score", 0)))))
-        return {"score": score, "reason": str(data.get("reason", ""))[:200]}
+        return {"score": score, "reason": str(data.get("reason", ""))[:200],
+                "input_text": input_text, "output_text": raw_output}
     except Exception as e:  # robust to endpoints lacking json mode, etc.
-        m = re.search(r'"?score"?\s*[:=]\s*(\d+)', str(locals().get("resp", "")))
-        return {"score": int(m.group(1)) if m else 0, "reason": f"parse-fallback: {e}"[:120]}
+        m = re.search(r'"?score"?\s*[:=]\s*(\d+)', raw_output)
+        return {"score": int(m.group(1)) if m else 0,
+                "reason": f"parse-fallback: {e}"[:120],
+                "input_text": input_text, "output_text": raw_output}

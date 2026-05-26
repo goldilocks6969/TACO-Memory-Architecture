@@ -9,6 +9,7 @@ dependencies = [
     "openai>=1.30",
     "numpy>=1.24",
     "python-dotenv>=1.0",
+    "tiktoken>=0.7",
 ]
 
 [project.scripts]

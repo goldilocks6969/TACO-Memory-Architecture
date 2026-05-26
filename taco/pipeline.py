@@ -5,11 +5,12 @@
       → infer state S
       → orchestrator resolves the six subsystems + the reasoning stance
       → L9 predict trajectory (anticipatory prefetch when escalating)
-      → cast 20 candidates (pgvector kNN) → re-rank by R(m) → top 4
-      → L7 reconsolidate retrieved memories that are re-held from a changed state
+      → cast episode candidates → re-rank → L7 reconsolidate the re-held episodes
+      → cast FACT candidates → re-rank by R(m) → top-k (+ always-on open threads)
       → assemble narrative briefing (stance + L10 self-model + L9 prediction)
       → single reasoning-engine invocation
-      → write-time salience gate (store or drop)
+      → write path: episodes gated by θ(S); facts gated by θ_facts(S), then
+        ADD/UPDATE/MERGE/DELETE/NOOP reconciliation against existing facts
       → L10 consolidate identity from significant moments
       → state + memory write-back  (feedback updates S)
 """
@@ -18,12 +19,13 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import psycopg
 
 from . import config, embeddings, llm
-from .memory import decay, identity, reconsolidation, retrieval, salience, store
+from .memory import (decay, extract, identity, operations, reconsolidation,
+                     retrieval, salience, store)
 from .memory.episode import Episode
 from .state import ContentSignal, LatentState, infer_state
 from .subsystems import orchestrator, prediction
@@ -42,7 +44,9 @@ class TurnResult:
     briefing: str
     prediction: Optional[PredictiveContinuity] = None
     reconsolidated: int = 0
+    recon_beliefs: List[str] = field(default_factory=list)
     identity_updates: List[identity.IdentityUpdate] = field(default_factory=list)
+    briefing_sections: Dict[str, str] = field(default_factory=dict)
 
 
 class Taco:
@@ -65,13 +69,15 @@ class Taco:
 
     def turn(self, user_message: str,
              hours_since_last: Optional[float] = None) -> TurnResult:
-        # 1. interoception: read the message's affect + salience in one call
-        analysis = llm.analyze(user_message)
+        # 1. interoception + light extraction: affect + entities + cues in one call
+        light = extract.light_extract(user_message)
+        analysis = {"emotional": light.emotional, "vulnerability": light.vulnerability,
+                    "salience": light.salience, "tone": light.tone}
 
         # 2. infer the new latent state S
         gap = self._hours_since_last() if hours_since_last is None else hours_since_last
-        signal = ContentSignal(emotional=analysis["emotional"],
-                               vulnerability=analysis["vulnerability"])
+        signal = ContentSignal(emotional=light.emotional,
+                               vulnerability=light.vulnerability)
         self.state = infer_state(self.state, signal, gap)
 
         # 3. orchestrator resolves all six subsystems + the reasoning stance from S
@@ -83,39 +89,48 @@ class Taco:
         recent_salient = store.recent_salient_episodes(self.conn)
         pred = prediction.predict(history, recent_salient)
 
-        # 5. retrieval: cast → (state-gated anticipatory prefetch) → re-rank → top-k
+        # 5. retrieval. Episodes still feed L7 reconsolidation (they are the raw
+        #    affective record); FACTS are the retrieval target for the briefing.
         q_emb = embeddings.embed_list(user_message)
-        candidates = store.knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
-        if pred.prefetch_query and pred.prefetch_query != user_message:
-            seen = {c.id for c in candidates}
-            pf_emb = embeddings.embed_list(pred.prefetch_query)
-            for c in store.knn_candidates(self.conn, pf_emb, config.PREFETCH_K):
-                if c.id not in seen:
-                    candidates.append(c)
-        top = retrieval.rerank(candidates, self.state, top_k=config.TOP_K)
-        store.touch_access(self.conn, [m.id for m in top if m.id])
+        epi_cands = store.knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
+        top_epi = retrieval.rerank(epi_cands, self.state, top_k=config.TOP_K)
+        store.touch_access(self.conn, [m.id for m in top_epi if m.id])
 
-        # 6. L7 reconsolidation: re-remembering a memory from a changed state
-        #    rewrites its meaning and attenuates its charge (before beliefs are read).
+        # 6. L7 reconsolidation on the re-held episodes (before beliefs are read).
         current_tone = retrieval.state_tone(self.state)
         recon = reconsolidation.reconsolidate(
-            self.conn, top, self.state, current_tone,
+            self.conn, top_epi, self.state, current_tone,
             llm.reconsolidate, embeddings.embed_list)
+
+        # 6b. fact retrieval (+ state-gated anticipatory prefetch) → re-rank → top-k.
+        fact_cands = store.fact_knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
+        if pred.prefetch_query and pred.prefetch_query != user_message:
+            seen = {c.id for c in fact_cands}
+            pf_emb = embeddings.embed_list(pred.prefetch_query)
+            for c in store.fact_knn_candidates(self.conn, pf_emb, config.PREFETCH_K):
+                if c.id not in seen:
+                    fact_cands.append(c)
+        top = retrieval.rerank(fact_cands, self.state, top_k=config.TOP_K)
+        top = self._surface_threads(top)  # open threads always included (Phase 1.6)
 
         beliefs = store.belief_candidates(self.conn, q_emb, k=2)
         identity_lines = identity.snapshot_lines(self.conn)  # L10 self-model
 
         # 7. assemble the narrative briefing (stance + self-model + prediction)
-        briefing = retrieval.assemble_briefing(
+        sections = retrieval.briefing_sections(
             top, beliefs, list(self.working), self.state, plan.stance,
             identity=identity_lines, prediction=pred)
+        briefing = retrieval._join_sections(sections)
 
         # 8. single reasoning-engine invocation
         response = llm.respond(briefing, user_message, plan.planning_depth)
 
-        # 9. write-time salience gate on the user's turn
+        # 9. write path. Episodes are gated by the emotional threshold θ(S); facts
+        #    by the lower informational gate θ_facts(S), so paraphrasable content
+        #    survives even when it carries little emotional charge.
         stored = salience.gate(analysis["salience"], self.state)
         identity_updates: List[identity.IdentityUpdate] = []
+        ep_id: Optional[int] = None
         if stored:
             ep = salience.build_episode("user", user_message, analysis)
             ep_id = store.add_episode(self.conn, ep, q_emb, self.state)
@@ -125,6 +140,10 @@ class Taco:
             identity_updates = identity.consolidate(
                 self.conn, user_message, analysis["salience"], self.state,
                 llm.extract_identity)
+
+        # 9b. extract + reconcile structured facts (ADD/UPDATE/MERGE/DELETE/NOOP).
+        if light.salience >= self.state.theta_facts():
+            self._write_facts(user_message, light, ep_id)
 
         # 10. write-back: working memory + persisted state
         self.working.append(Episode(content=user_message, role="user",
@@ -136,7 +155,29 @@ class Taco:
                           analysis=analysis, retrieved=top, stored=stored,
                           briefing=briefing, prediction=pred,
                           reconsolidated=recon.count,
-                          identity_updates=identity_updates)
+                          recon_beliefs=[b for _, b in recon.rewrites],
+                          identity_updates=identity_updates,
+                          briefing_sections=sections)
+
+    # ------------------------------------------------------------------ #
+    def _write_facts(self, user_message: str, light: "extract.LightExtract",
+                     source_episode_id: Optional[int]) -> None:
+        """Full-extract a salient turn and reconcile each fact against neighbours."""
+        full = extract.full_extract(user_message, light)
+        for fact in full.facts:
+            f_emb = embeddings.embed_list(fact.summary)
+            neighbors = store.fact_neighbors(self.conn, f_emb, k=3, min_sim=0.7)
+            action = operations.decide_action(fact, neighbors)
+            operations.apply(self.conn, action, fact, f_emb,
+                             source_episode_id, self.state)
+
+    def _surface_threads(self, top: List[Episode]) -> List[Episode]:
+        """Always include open threads due within 7 days, regardless of score."""
+        threads = store.due_threads(self.conn, within_days=7)
+        if not threads:
+            return top
+        have = {m.id for m in top}
+        return [t for t in threads if t.id not in have] + top
 
     # ------------------------------------------------------------------ #
     def probe(self, user_message: str) -> TurnResult:
@@ -146,9 +187,11 @@ class Taco:
         probe's own affect still transiently shapes S (state modulates retrieval),
         but nothing is persisted.
         """
-        analysis = llm.analyze(user_message)
-        signal = ContentSignal(emotional=analysis["emotional"],
-                               vulnerability=analysis["vulnerability"])
+        light = extract.light_extract(user_message)
+        analysis = {"emotional": light.emotional, "vulnerability": light.vulnerability,
+                    "salience": light.salience, "tone": light.tone}
+        signal = ContentSignal(emotional=light.emotional,
+                               vulnerability=light.vulnerability)
         state = infer_state(self.state, signal, 0.5)  # transient, not persisted
         plan = orchestrator.plan(state)
 
@@ -156,18 +199,20 @@ class Taco:
         pred = prediction.predict(history, store.recent_salient_episodes(self.conn))
 
         q_emb = embeddings.embed_list(user_message)
-        candidates = store.knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
-        top = retrieval.rerank(candidates, state, top_k=config.TOP_K)
+        fact_cands = store.fact_knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
+        top = self._surface_threads(retrieval.rerank(fact_cands, state, top_k=config.TOP_K))
         beliefs = store.belief_candidates(self.conn, q_emb, k=2)
         identity_lines = identity.snapshot_lines(self.conn)
-        briefing = retrieval.assemble_briefing(
+        sections = retrieval.briefing_sections(
             top, beliefs, list(self.working), state, plan.stance,
             identity=identity_lines, prediction=pred)
+        briefing = retrieval._join_sections(sections)
         response = llm.respond(briefing, user_message, plan.planning_depth)
 
         return TurnResult(response=response, state=state, plan=plan,
                           analysis=analysis, retrieved=top, stored=False,
-                          briefing=briefing, prediction=pred)
+                          briefing=briefing, prediction=pred,
+                          briefing_sections=sections)
 
     def run_decay(self, extra_weeks: float = 0.0) -> decay.DecayReport:
         """Run the forgetting engine (tier decay + abstraction-before-pruning)."""

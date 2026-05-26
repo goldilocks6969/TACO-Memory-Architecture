@@ -15,6 +15,11 @@ from . import harness, metrics, plots
 OUT = Path(__file__).resolve().parent / "out"
 
 
+def _fmt(v) -> str:
+    """Render a (possibly null) numeric headline; ``None`` becomes ``n/a``."""
+    return "n/a" if v is None else f"{v:.0f}"
+
+
 def _qualitative_example(rows: List[Dict]) -> Dict:
     """Emotional-continuity probe with the largest Taco-over-RAG margin."""
     pairs: Dict = {}
@@ -61,10 +66,16 @@ def _write_report(agg: Dict, rows: List[Dict]) -> Path:
     L.append("|---|---:|---:|")
     L.append(f"| Overall continuity (0–100) | {agg['overall']['rag']:.0f} | "
              f"{agg['overall']['taco']:.0f} |")
-    L.append(f"| **CES** (continuity / 1k retrieval tok) | {agg['ces']['rag']:.0f} | "
-             f"**{agg['ces']['taco']:.0f}** |")
+    L.append(f"| **CES_retrieval** (continuity / 1k retrieval tok) | "
+             f"{_fmt(agg['ces_retrieval']['rag'])} | "
+             f"**{_fmt(agg['ces_retrieval']['taco'])}** |")
+    L.append(f"| **CES_total** (continuity / 1k total context tok) | "
+             f"{_fmt(agg['ces_total']['rag'])} | "
+             f"{_fmt(agg['ces_total']['taco'])} |")
     L.append(f"| Retrieval payload (tok/turn) | {agg['retrieval_tokens']['rag']:.0f} | "
              f"{agg['retrieval_tokens']['taco']:.0f} |")
+    L.append(f"| State briefing (tok/turn) | {agg['tokens']['rag']['state_briefing_tokens']:.0f} | "
+             f"{agg['tokens']['taco']['state_briefing_tokens']:.0f} |")
     L.append(f"| Total injected context (tok/turn) | {agg['total_tokens']['rag']:.0f} | "
              f"{agg['total_tokens']['taco']:.0f} |")
     L.append(f"| Retrieved items / turn | {agg['n_memories']['rag']:.1f} | "
@@ -78,8 +89,15 @@ def _write_report(agg: Dict, rows: List[Dict]) -> Path:
              "salience gating).")
     L.append("")
     L.append("![overall](out/overall.png)")
-    L.append("![ces](out/ces.png)")
+    L.append("![ces_retrieval](out/ces_retrieval.png)")
+    L.append("![ces_total](out/ces_total.png)")
+    L.append("![retrieval vs total efficiency](out/retrieval_vs_total_efficiency.png)")
     L.append("")
+    if agg.get("warnings"):
+        L.append("> **Honest comparison checks:**")
+        for w in agg["warnings"]:
+            L.append(f"> - {w}")
+        L.append("")
 
     # dimensions
     L.append("## Continuity by dimension")
@@ -111,12 +129,15 @@ def _write_report(agg: Dict, rows: List[Dict]) -> Path:
     L.append("- **Retrieved items** `m`: number of memories injected.")
     L.append("- **Compression ratio** `CR = C_taco / C_baseline`, the ratio of "
              "stored corpus sizes after each policy's write-time decisions.")
-    L.append("- **Continuity Efficiency Score** `CES = Q / R_tok`, reported per "
-             "1,000 retrieval tokens, where `Q` is overall continuity. CES is the "
-             "primary comparison metric: continuity delivered per unit retrieval "
-             "overhead.")
+    L.append("- **CES_retrieval** `= Q / R_tok × 1000` — continuity per 1,000 "
+             "retrieval tokens. Measures memory-policy efficiency.")
+    L.append("- **CES_total** `= Q / T_tok × 1000` — continuity per 1,000 *total* "
+             "context tokens (system + memory + query). The honest full-prompt "
+             "comparison: TACO's structured state briefing pushes T_tok up, so a "
+             "CES_retrieval win does not automatically imply a CES_total win.")
     L.append("")
     L.append("![tokens](out/tokens.png)")
+    L.append("![token breakdown](out/token_breakdown.png)")
     L.append("")
 
     # scale analysis
@@ -202,15 +223,24 @@ def main() -> None:
 
     agg = metrics.aggregate(result)
     (OUT / "summary.json").write_text(json.dumps(agg, indent=2))
+    summary_csv = metrics.write_summary_csv(agg, OUT / "summary.csv")
     plots.make_all(agg, str(OUT))
     report = _write_report(agg, result["rows"])
 
     print("\n=== continuity benchmark (revised) ===")
     print(f"overall continuity : RAG {agg['overall']['rag']:.0f}  Taco {agg['overall']['taco']:.0f}")
-    print(f"CES (cont/1k rtok) : RAG {agg['ces']['rag']:.0f}  Taco {agg['ces']['taco']:.0f}")
-    print(f"retrieval tok/turn : RAG {agg['retrieval_tokens']['rag']:.0f}  Taco {agg['retrieval_tokens']['taco']:.0f}")
-    print(f"total tok/turn     : RAG {agg['total_tokens']['rag']:.0f}  Taco {agg['total_tokens']['taco']:.0f}")
+    print(f"CES_retrieval      : RAG {_fmt(agg['ces_retrieval']['rag'])}  "
+          f"Taco {_fmt(agg['ces_retrieval']['taco'])}  (continuity / 1k retrieval tok)")
+    print(f"CES_total          : RAG {_fmt(agg['ces_total']['rag'])}  "
+          f"Taco {_fmt(agg['ces_total']['taco'])}  (continuity / 1k total context tok)")
+    print(f"retrieval tok/turn : RAG {agg['retrieval_tokens']['rag']:.0f}  "
+          f"Taco {agg['retrieval_tokens']['taco']:.0f}")
+    print(f"total tok/turn     : RAG {agg['total_tokens']['rag']:.0f}  "
+          f"Taco {agg['total_tokens']['taco']:.0f}")
     print(f"compression ratio  : {agg['compression']['ratio']}")
+    for w in agg.get("warnings", []):
+        print(f"WARNING: {w}")
+    print(f"summary.csv: {summary_csv}")
     print(f"report: {report}")
 
 

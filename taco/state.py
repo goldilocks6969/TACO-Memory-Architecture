@@ -69,6 +69,15 @@ class LatentState:
         theta = base + (config.THETA_MAX - base) * engagement_penalty * 0.5
         return round(max(config.THETA_MIN, min(config.THETA_MAX, theta)), 2)
 
+    def theta_facts(self) -> float:
+        """Lower, informational gate for extracted facts (vs. the emotional θ).
+
+        Facts are the retrieval target, so paraphrasable low-arousal content (a
+        name, a plan, a preference) should survive even when emotional charge is
+        low. Sits a fixed step below θ(S) with a hard floor.
+        """
+        return max(1.5, self.theta() - 2.0)
+
     # ---- §4.2  emotional retrieval weight w_emo(V) ------------------------ #
     def w_emo(self) -> float:
         """Emotional retrieval weight, rises linearly with V from 0.20→0.48 (Fig 7a)."""

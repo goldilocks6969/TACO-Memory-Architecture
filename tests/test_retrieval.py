@@ -47,9 +47,11 @@ def test_rerank_selects_top_k_by_score():
         _ep(content="mid", similarity=0.5, salience=5, tone="concerned"),
         _ep(content="emo match", similarity=0.3, salience=6, tone="distress"),
         _ep(content="filler", similarity=0.2, salience=1, tone="neutral"),
+        _ep(content="extra a", similarity=0.4, salience=3, tone="neutral"),
+        _ep(content="extra b", similarity=0.15, salience=2, tone="neutral"),
     ]
     top = retrieval.rerank(cands, s, top_k=config.TOP_K)
-    assert len(top) == config.TOP_K
+    assert len(top) == config.TOP_K  # more candidates than TOP_K → returns exactly TOP_K
     # scores are sorted descending
     assert all(top[i].score >= top[i + 1].score for i in range(len(top) - 1))
     # the strongest candidate wins

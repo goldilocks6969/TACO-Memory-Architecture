@@ -190,6 +190,49 @@ The tests validate the pure cognitive logic: the modulation curves and their
 endpoints, the state-dependent salience gate, `R(m)` scoring and re-ranking, and
 the tier decay schedule against the paper's stated values.
 
+## Evaluation: two efficiency metrics, not one
+
+The continuity benchmark in [`eval/`](eval/) compares Taco against a naive RAG
+baseline under an identical base LLM. To stay honest about *where* Taco wins,
+the harness reports **two** efficiency numbers per system:
+
+| Metric | Formula | What it measures |
+|--------|---------|------------------|
+| **CES_retrieval** | `Q / avg_retrieval_tokens × 1000` | Memory-policy efficiency — continuity per 1,000 *retrieval* tokens. |
+| **CES_total**     | `Q / avg_total_context_tokens × 1000` | Full-prompt efficiency — continuity per 1,000 *total* injected context tokens (system + state briefing + retrieval + query). |
+
+The split matters because Taco injects a structured state briefing on top of
+its retrieved memories, so the **total** prompt sent to the LLM can be larger
+than naive RAG's even when the retrieved payload is much smaller and bounded.
+Quoting only `CES_retrieval` would hide that overhead.
+
+Taco's current design target is **retrieval quality + bounded retrieval
+overhead**, i.e. winning on `CES_retrieval`. Compressing the state briefing so
+`CES_total` also leads is a separate optimization goal we have not yet pursued.
+The harness prints two warnings to make this explicit:
+
+- *"TACO is retrieval-efficient but not total-context-efficient in this run."*
+  — when Taco leads on `CES_retrieval` but loses on `CES_total`.
+- *"TACO uses larger total injected context; optimize state briefing compression."*
+  — when Taco's average `total_context_tokens` exceeds RAG's.
+
+The legacy single-number `CES` is retained as an alias for `CES_retrieval` so
+older reports still resolve.
+
+### What the harness records per probe
+
+`retrieval_tokens`, `state_briefing_tokens`, `memory_context_tokens`,
+`system_prompt_tokens`, `user_query_tokens`, `total_context_tokens`,
+`answer_tokens`, `judge_input_tokens`, `judge_output_tokens`. Token counts use
+[tiktoken](https://github.com/openai/tiktoken) with `cl100k_base` as a
+fallback. `eval/out/summary.csv` aggregates these into the per-system headline
+numbers (`overall_quality`, the average of each token component, both CES
+scores, and the percent savings vs. RAG).
+
+```bash
+python3 -m eval.run                          # writes results.json, summary.csv, *.png
+```
+
 ## Project layout
 
 ```

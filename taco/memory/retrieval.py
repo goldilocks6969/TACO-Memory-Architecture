@@ -83,6 +83,101 @@ def rerank(candidates: List[Episode], state: LatentState,
 # --------------------------------------------------------------------------- #
 # Context assembly (Figure 4 step 4)
 # --------------------------------------------------------------------------- #
+_SYSTEM_PROMPT = (
+    "You are the reasoning engine inside a state-dependent cognitive memory "
+    "layer. A separate system has inferred the user's current state and "
+    "selected the most relevant memories. Respond naturally; let the state, "
+    "the memories, and the reasoning directives below shape both what you say "
+    "and what you choose to do."
+)
+
+
+def briefing_sections(
+    memories: List[Episode], beliefs: List[str], working: List[Episode],
+    state: LatentState, stance: Optional["ReasoningStance"] = None,
+    identity: Optional[List[str]] = None,
+    prediction: Optional["PredictiveContinuity"] = None,
+) -> Dict[str, str]:
+    """Return the briefing broken down into its logical sections.
+
+    Section keys:
+      ``system``     — fixed scaffolding the engine always sees.
+      ``state``      — the current S = (E, K, V, R) line and reasoning stance.
+      ``identity``   — L10 persistent self-model.
+      ``working``    — L1 working-memory transcript.
+      ``prediction`` — L9 anticipatory continuity block.
+      ``retrieval``  — the retrieved memory / fact payload (the policy-dependent
+                       component — what the eval harness charges as
+                       retrieval_tokens).
+
+    The eval harness uses these to attribute tokens: ``retrieval`` is the
+    retrieval payload, ``system`` is the fixed system prompt, and everything
+    else (``state``, ``identity``, ``working``, ``prediction``) is the
+    structured "state briefing" overhead TACO adds on top of vanilla RAG.
+    """
+    state_lines: List[str] = [
+        f"User state — emotional intensity {state.E:.0f}/100, engagement "
+        f"{state.K:.0f}/100, vulnerability {state.V:.0f}/100, recency "
+        f"{state.R:.0f}/100 (current tone: {state_tone(state)})."
+    ]
+    if stance is not None:
+        state_lines.append("")
+        state_lines.append(stance.render())
+
+    identity_lines: List[str] = []
+    if identity:
+        identity_lines.append(
+            "Persistent self-model (who this person is, across time):"
+        )
+        for fact in identity:
+            identity_lines.append(f"  • {fact}")
+
+    retrieval_lines: List[str] = []
+    if beliefs:
+        retrieval_lines.append("Durable, identity-level beliefs about this person:")
+        for b in beliefs:
+            retrieval_lines.append(f"  • {b}")
+    if memories:
+        if retrieval_lines:
+            retrieval_lines.append("")
+        retrieval_lines.append(
+            "Psychologically privileged memories (re-ranked by R(m), most "
+            "significant first):"
+        )
+        for m in memories:
+            retrieval_lines.append(
+                f"  • [{m.tone or 'neutral'}, salience {m.salience:.0f}/10, "
+                f"R={m.score:.2f}] {m.content}"
+            )
+
+    working_lines: List[str] = []
+    if working:
+        working_lines.append("Recent conversation (working memory):")
+        for w in working:
+            working_lines.append(f"  {w.role}: {w.content}")
+
+    prediction_lines: List[str] = []
+    if prediction is not None:
+        prediction_lines.append("Predictive continuity (anticipatory, not yet stated):")
+        prediction_lines.append(prediction.render())
+
+    return {
+        "system": _SYSTEM_PROMPT,
+        "state": "\n".join(state_lines),
+        "identity": "\n".join(identity_lines),
+        "retrieval": "\n".join(retrieval_lines),
+        "working": "\n".join(working_lines),
+        "prediction": "\n".join(prediction_lines),
+    }
+
+
+def _join_sections(sections: Dict[str, str]) -> str:
+    """Re-join section blocks with blank-line separators, preserving order."""
+    order = ("system", "state", "identity", "retrieval", "working", "prediction")
+    blocks = [sections[k] for k in order if sections.get(k)]
+    return "\n\n".join(blocks)
+
+
 def assemble_briefing(memories: List[Episode], beliefs: List[str],
                       working: List[Episode], state: LatentState,
                       stance: Optional["ReasoningStance"] = None,
@@ -97,62 +192,5 @@ def assemble_briefing(memories: List[Episode], beliefs: List[str],
     it frames the memories as cognitively privileged and shifts the reasoning
     rules with the user's state.
     """
-    lines: List[str] = []
-    lines.append(
-        "You are the reasoning engine inside a state-dependent cognitive memory "
-        "layer. A separate system has inferred the user's current state and "
-        "selected the most relevant memories. Respond naturally; let the state, "
-        "the memories, and the reasoning directives below shape both what you say "
-        "and what you choose to do."
-    )
-    lines.append("")
-    lines.append(
-        f"User state — emotional intensity {state.E:.0f}/100, engagement "
-        f"{state.K:.0f}/100, vulnerability {state.V:.0f}/100, recency "
-        f"{state.R:.0f}/100 (current tone: {state_tone(state)})."
-    )
-
-    # The memory-conditioned reasoning stance — placed before the memories so the
-    # engine reads *how* to weigh them before it reads them.
-    if stance is not None:
-        lines.append("")
-        lines.append(stance.render())
-
-    # L10: the persistent self-model — the most durable layer, asserted first.
-    if identity:
-        lines.append("")
-        lines.append("Persistent self-model (who this person is, across time):")
-        for fact in identity:
-            lines.append(f"  • {fact}")
-
-    if beliefs:
-        lines.append("")
-        lines.append("Durable, identity-level beliefs about this person:")
-        for b in beliefs:
-            lines.append(f"  • {b}")
-
-    if memories:
-        lines.append("")
-        lines.append(
-            "Psychologically privileged memories (re-ranked by R(m), most "
-            "significant first):"
-        )
-        for m in memories:
-            lines.append(
-                f"  • [{m.tone or 'neutral'}, salience {m.salience:.0f}/10, "
-                f"R={m.score:.2f}] {m.content}"
-            )
-
-    if working:
-        lines.append("")
-        lines.append("Recent conversation (working memory):")
-        for w in working:
-            lines.append(f"  {w.role}: {w.content}")
-
-    # L9: where this is heading — lets the engine get ahead of the user.
-    if prediction is not None:
-        lines.append("")
-        lines.append("Predictive continuity (anticipatory, not yet stated):")
-        lines.append(prediction.render())
-
-    return "\n".join(lines)
+    return _join_sections(briefing_sections(
+        memories, beliefs, working, state, stance, identity, prediction))

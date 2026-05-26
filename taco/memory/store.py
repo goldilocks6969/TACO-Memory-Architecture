@@ -8,6 +8,7 @@ import numpy as np
 import psycopg
 
 from .episode import Episode
+from .fact import Fact
 from ..state import LatentState
 
 
@@ -89,6 +90,154 @@ def recent_episodes(conn: psycopg.Connection, limit: int = 6) -> List[Episode]:
     ).fetchall()
     return [Episode(id=r[0], role=r[1], content=r[2], salience=r[3],
                     tone=r[4], created_at=r[5]) for r in reversed(rows)]
+
+
+# --------------------------------------------------------------------------- #
+# Facts (Phase 1) — the structured retrieval target
+# --------------------------------------------------------------------------- #
+def _cues_text(cues) -> Optional[str]:
+    return " ".join(cues) if cues else None
+
+
+def add_fact(conn: psycopg.Connection, fact: Fact, embedding: List[float],
+             source_episode_id: Optional[int] = None,
+             state: Optional[LatentState] = None) -> int:
+    """Insert a new fact and return its id. `cues_text` is kept in sync with
+    `retrieval_cues` (the array can't be trigram-indexed directly)."""
+    src = [source_episode_id] if source_episode_id else None
+    row = conn.execute(
+        """
+        INSERT INTO facts
+            (summary, embedding, event_type, fact_type, emotional_tone,
+             emotional_cause, user_belief, salience, retrieval_cues, cues_text,
+             entity_keys, validity, thread_status, due_date, confidence,
+             source_episode_ids)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING id
+        """,
+        (fact.summary, _vec(embedding), fact.event_type, fact.fact_type,
+         fact.emotional_tone, fact.emotional_cause, fact.user_belief,
+         fact.salience, fact.retrieval_cues or None, _cues_text(fact.retrieval_cues),
+         fact.entity_keys or None, fact.validity, fact.thread_status,
+         fact.due_date, fact.confidence, src),
+    ).fetchone()
+    fact.id = row[0]
+    return fact.id
+
+
+def fact_neighbors(conn: psycopg.Connection, embedding: List[float],
+                   k: int = 3, min_sim: float = 0.7) -> List[Fact]:
+    """Nearest CURRENT facts above a similarity floor — the dedup candidates."""
+    emb = _vec(embedding)
+    rows = conn.execute(
+        """
+        SELECT id, summary, salience, emotional_tone, entity_keys,
+               1 - (embedding <=> %s) AS sim
+        FROM facts
+        WHERE validity = 'current' AND embedding IS NOT NULL
+        ORDER BY embedding <=> %s
+        LIMIT %s
+        """,
+        (emb, emb, k),
+    ).fetchall()
+    out: List[Fact] = []
+    for r in rows:
+        if float(r[5]) < min_sim:
+            continue
+        out.append(Fact(id=r[0], summary=r[1], salience=r[2],
+                        emotional_tone=r[3], entity_keys=list(r[4] or []),
+                        similarity=max(0.0, float(r[5]))))
+    return out
+
+
+def _fact_row_to_episode(r) -> Episode:
+    """Adapt a fact row into an Episode so the existing reranker/briefing (which
+    are episode-shaped) can consume facts unchanged in Phase 1."""
+    return Episode(
+        id=r[0], role="memory", content=r[1], salience=float(r[2]),
+        vitality=float(r[3]), tone=r[4], created_at=r[5],
+        similarity=max(0.0, float(r[6])),
+    )
+
+
+def fact_knn_candidates(conn: psycopg.Connection, query_embedding: List[float],
+                        k: int, only_current: bool = True) -> List[Episode]:
+    """Cast the nearest facts (as Episode adapters) for the briefing path."""
+    where = "embedding IS NOT NULL" + (" AND validity = 'current'" if only_current else "")
+    emb = _vec(query_embedding)
+    rows = conn.execute(
+        f"""
+        SELECT id, summary, salience, vitality, emotional_tone, created_at,
+               1 - (embedding <=> %s) AS similarity
+        FROM facts
+        WHERE {where}
+        ORDER BY embedding <=> %s
+        LIMIT %s
+        """,
+        (emb, emb, k),
+    ).fetchall()
+    return [_fact_row_to_episode(r) for r in rows]
+
+
+def merge_fact(conn: psycopg.Connection, target_id: int, content: str,
+               embedding: List[float], source_episode_id: Optional[int],
+               cues=None) -> None:
+    """MERGE: refresh an existing fact in place and extend its lineage."""
+    conn.execute(
+        """
+        UPDATE facts
+        SET summary = %s,
+            embedding = %s,
+            retrieval_cues = COALESCE(retrieval_cues, '{}') || %s,
+            cues_text = trim(both ' ' from COALESCE(cues_text,'') || ' ' || %s),
+            source_episode_ids = CASE WHEN %s IS NULL THEN source_episode_ids
+                ELSE COALESCE(source_episode_ids, '{}') || %s END,
+            confidence = least(1.0, confidence + 0.1),
+            updated_at = now()
+        WHERE id = %s
+        """,
+        (content, _vec(embedding), (cues or []), _cues_text(cues) or "",
+         source_episode_id, [source_episode_id] if source_episode_id else None,
+         target_id),
+    )
+
+
+def supersede_fact(conn: psycopg.Connection, old_id: int, new_id: int) -> None:
+    """UPDATE: retire the old fact, pointing it at the new current one."""
+    conn.execute(
+        """UPDATE facts
+           SET validity = 'outdated', valid_until = now(),
+               superseded_by = %s, updated_at = now()
+           WHERE id = %s""",
+        (new_id, old_id),
+    )
+
+
+def mark_fact_outdated(conn: psycopg.Connection, fact_id: int) -> None:
+    """DELETE (soft): the user retracted this fact; keep it but mark it outdated."""
+    conn.execute(
+        """UPDATE facts SET validity = 'outdated', valid_until = now(),
+               updated_at = now() WHERE id = %s""",
+        (fact_id,),
+    )
+
+
+def due_threads(conn: psycopg.Connection, within_days: int = 7) -> List[Episode]:
+    """Open threads (L-thread) whose due_date lands within the window — always
+    surfaced in the briefing regardless of retrieval score (Phase 1.6)."""
+    rows = conn.execute(
+        """
+        SELECT id, summary, salience, vitality, emotional_tone, created_at, 1.0
+        FROM facts
+        WHERE fact_type = 'thread' AND thread_status = 'unresolved'
+              AND validity = 'current' AND due_date IS NOT NULL
+              AND due_date <= now() + (%s || ' days')::interval
+              AND due_date >= now() - interval '1 day'
+        ORDER BY due_date ASC
+        """,
+        (within_days,),
+    ).fetchall()
+    return [_fact_row_to_episode(r) for r in rows]
 
 
 # --------------------------------------------------------------------------- #

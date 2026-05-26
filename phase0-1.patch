@@ -1,0 +1,1204 @@
+diff --git a/eval/harness.py b/eval/harness.py
+index 59812cb..a195714 100644
+--- a/eval/harness.py
++++ b/eval/harness.py
+@@ -66,6 +66,7 @@ def _taco_corpus_tokens(conn, ntok) -> int:
+ 
+ 
+ def run() -> Dict:
++    assert not config.MOCK, "Evaluation must run with real LLMs"
+     ntok = _token_counter()
+     db.init_db(EVAL_DSN)
+     conn = db.connect(EVAL_DSN)
+diff --git a/eval/judge.py b/eval/judge.py
+index 10987b4..214f932 100644
+--- a/eval/judge.py
++++ b/eval/judge.py
+@@ -45,8 +45,12 @@ _RUBRIC = (
+ 
+ 
+ def judge(probe_text: str, ground_truth: str, kind: str, response: str) -> Dict:
+-    if config.MOCK or not config.OPENAI_API_KEY:
++    if config.MOCK:
+         return {"score": _mock_score(response, ground_truth), "reason": "mock"}
++    if not config.OPENAI_API_KEY:
++        raise RuntimeError(
++            "No API key configured — set OPENAI_API_KEY or TACO_MOCK=1 explicitly"
++        )
+ 
+     from taco.llm import _client
+     from taco.retry import with_retries
+diff --git a/schema.sql b/schema.sql
+index 483fcd5..9e7cefe 100644
+--- a/schema.sql
++++ b/schema.sql
+@@ -10,6 +10,7 @@
+ -- being tables themselves; L9 (predictive prefetch) reads them.
+ 
+ CREATE EXTENSION IF NOT EXISTS vector;
++CREATE EXTENSION IF NOT EXISTS pg_trgm;   -- trigram (BM25-ish) matching for facts
+ 
+ -- L2: event-based autobiographical history. Each row is one stored episode.
+ CREATE TABLE IF NOT EXISTS episodes (
+@@ -35,6 +36,67 @@ CREATE INDEX IF NOT EXISTS episodes_embedding_idx
+     ON episodes USING hnsw (embedding vector_cosine_ops);
+ CREATE INDEX IF NOT EXISTS episodes_vitality_idx ON episodes (vitality);
+ 
++-- Structured FACTS — the retrieval target (Phase 1). Episodes stay the raw
++-- conversational record (feeding the L4 emotional timeline and L7
++-- reconsolidation); facts are extracted, deduplicated, paraphrase-retrievable
++-- units. Several columns (emotional_cause, user_belief, retrieval_cues) are
++-- TACO-specific and have no Mem0 equivalent.
++CREATE TABLE IF NOT EXISTS facts (
++    id            BIGSERIAL PRIMARY KEY,
++    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
++    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
++
++    -- Core content
++    summary       TEXT NOT NULL,        -- "User's father died of a heart attack last month"
++    embedding     vector(1536),         -- text-embedding-3-small for now; Phase 9 → bge-large(1024)
++
++    -- Classification
++    event_type    TEXT,                 -- conflict|goal|preference|fear|plan|relationship
++                                        -- |achievement|failure|health|money|identity|thread
++    fact_type     TEXT,                 -- 'preference'|'event'|'relationship'|'state'|'thread'
++
++    -- Emotional signal (TACO-specific, not in Mem0)
++    emotional_tone   TEXT,              -- 'distress' | 'tender' | 'concerned' | ...
++    emotional_cause  TEXT,              -- "fear of failing the interview again"
++    user_belief      TEXT,              -- "I mess up important opportunities"
++    salience         REAL NOT NULL,
++
++    -- Retrieval expansion (cheap recall booster, used by Phase 2 hybrid retrieval)
++    retrieval_cues   TEXT[],            -- alt phrasings: ["interview anxiety","fear of failure"]
++    cues_text        TEXT,              -- retrieval_cues joined; kept in sync by the app
++                                        -- (array_to_string isn't IMMUTABLE, so we can't
++                                        -- index the array directly — denormalize instead)
++
++    -- Entity graph (Phase 2)
++    entity_keys      TEXT[],            -- ["person:maya", "role:interview"]
++
++    -- Temporal validity (Phase 5)
++    valid_from       TIMESTAMPTZ,       -- when the fact became true
++    valid_until      TIMESTAMPTZ,       -- null = currently true
++
++    -- Lineage
++    source_episode_ids BIGINT[],        -- episodes this fact was drawn from
++    superseded_by      BIGINT REFERENCES facts(id),
++
++    -- Status: 'current' | 'outdated' | 'uncertain' | 'resolved'
++    validity      TEXT NOT NULL DEFAULT 'current',
++
++    -- Open-thread tracking (when fact_type = 'thread')
++    thread_status TEXT,                 -- 'unresolved' | 'in_progress' | 'resolved'
++    due_date      TIMESTAMPTZ,
++
++    -- Decay
++    vitality      REAL NOT NULL DEFAULT 1.0,
++    confidence    REAL NOT NULL DEFAULT 0.7
++);
++CREATE INDEX IF NOT EXISTS facts_embedding_idx
++    ON facts USING hnsw (embedding vector_cosine_ops);
++CREATE INDEX IF NOT EXISTS facts_entity_idx ON facts USING gin (entity_keys);
++CREATE INDEX IF NOT EXISTS facts_summary_trgm ON facts USING gin (summary gin_trgm_ops);
++CREATE INDEX IF NOT EXISTS facts_cues_trgm ON facts USING gin (cues_text gin_trgm_ops);
++CREATE INDEX IF NOT EXISTS facts_validity_idx ON facts (validity, valid_until);
++CREATE INDEX IF NOT EXISTS facts_threads_idx ON facts (thread_status) WHERE fact_type = 'thread';
++
+ -- L3: beliefs abstracted from decayed episodes (meaning outlives the event).
+ CREATE TABLE IF NOT EXISTS semantic_beliefs (
+     id            BIGSERIAL PRIMARY KEY,
+diff --git a/taco/config.py b/taco/config.py
+index 024474f..b994826 100644
+--- a/taco/config.py
++++ b/taco/config.py
+@@ -61,7 +61,7 @@ EMO_TONE_MATCH_BOOST = 0.30  # +0.3 if memory tone matches current user tone
+ RECENCY_WINDOW_DAYS = 30     # rec(m) is recency within a 30-day window
+ 
+ CANDIDATE_CAST = 20  # pgvector kNN candidates (Figure 4 step 1)
+-TOP_K = 4            # memories assembled into the briefing (Figure 4 step 3)
++TOP_K = 6            # memories assembled into the briefing (Figure 4 step 3)
+ 
+ 
+ # --------------------------------------------------------------------------- #
+diff --git a/taco/llm.py b/taco/llm.py
+index a2e86f9..82e54de 100644
+--- a/taco/llm.py
++++ b/taco/llm.py
+@@ -99,6 +99,22 @@ def _client():
+     return OpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
+ 
+ 
++def available() -> bool:
++    """Whether a real LLM should be used for this call.
++
++    False under TACO_MOCK=1 (use heuristics). True when a key is present.
++    Raises if no key is configured and mocking was not requested — the same
++    fail-loud contract as `analyze`, so cognition never silently degrades.
++    """
++    if config.MOCK:
++        return False
++    if not config.OPENAI_API_KEY:
++        raise RuntimeError(
++            "No API key configured — set OPENAI_API_KEY or TACO_MOCK=1 explicitly"
++        )
++    return True
++
++
+ def analyze(text: str) -> Dict:
+     """Return {emotional, vulnerability, salience, tone} for one turn.
+ 
+@@ -106,8 +122,12 @@ def analyze(text: str) -> Dict:
+     write-time salience gate (1–10), which is more token-efficient than two
+     separate judge calls (§6.1 token-efficiency argument).
+     """
+-    if config.MOCK or not config.OPENAI_API_KEY:
++    if config.MOCK:
+         return _heuristic_analyze(text)
++    if not config.OPENAI_API_KEY:
++        raise RuntimeError(
++            "No API key configured — set OPENAI_API_KEY or TACO_MOCK=1 explicitly"
++        )
+ 
+     sys = (
+         "You are the interoceptive sensor of a cognitive memory layer. Read the "
+diff --git a/taco/memory/store.py b/taco/memory/store.py
+index a6bcd76..b2b29b1 100644
+--- a/taco/memory/store.py
++++ b/taco/memory/store.py
+@@ -8,6 +8,7 @@ import numpy as np
+ import psycopg
+ 
+ from .episode import Episode
++from .fact import Fact
+ from ..state import LatentState
+ 
+ 
+@@ -91,6 +92,154 @@ def recent_episodes(conn: psycopg.Connection, limit: int = 6) -> List[Episode]:
+                     tone=r[4], created_at=r[5]) for r in reversed(rows)]
+ 
+ 
++# --------------------------------------------------------------------------- #
++# Facts (Phase 1) — the structured retrieval target
++# --------------------------------------------------------------------------- #
++def _cues_text(cues) -> Optional[str]:
++    return " ".join(cues) if cues else None
++
++
++def add_fact(conn: psycopg.Connection, fact: Fact, embedding: List[float],
++             source_episode_id: Optional[int] = None,
++             state: Optional[LatentState] = None) -> int:
++    """Insert a new fact and return its id. `cues_text` is kept in sync with
++    `retrieval_cues` (the array can't be trigram-indexed directly)."""
++    src = [source_episode_id] if source_episode_id else None
++    row = conn.execute(
++        """
++        INSERT INTO facts
++            (summary, embedding, event_type, fact_type, emotional_tone,
++             emotional_cause, user_belief, salience, retrieval_cues, cues_text,
++             entity_keys, validity, thread_status, due_date, confidence,
++             source_episode_ids)
++        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
++        RETURNING id
++        """,
++        (fact.summary, _vec(embedding), fact.event_type, fact.fact_type,
++         fact.emotional_tone, fact.emotional_cause, fact.user_belief,
++         fact.salience, fact.retrieval_cues or None, _cues_text(fact.retrieval_cues),
++         fact.entity_keys or None, fact.validity, fact.thread_status,
++         fact.due_date, fact.confidence, src),
++    ).fetchone()
++    fact.id = row[0]
++    return fact.id
++
++
++def fact_neighbors(conn: psycopg.Connection, embedding: List[float],
++                   k: int = 3, min_sim: float = 0.7) -> List[Fact]:
++    """Nearest CURRENT facts above a similarity floor — the dedup candidates."""
++    emb = _vec(embedding)
++    rows = conn.execute(
++        """
++        SELECT id, summary, salience, emotional_tone, entity_keys,
++               1 - (embedding <=> %s) AS sim
++        FROM facts
++        WHERE validity = 'current' AND embedding IS NOT NULL
++        ORDER BY embedding <=> %s
++        LIMIT %s
++        """,
++        (emb, emb, k),
++    ).fetchall()
++    out: List[Fact] = []
++    for r in rows:
++        if float(r[5]) < min_sim:
++            continue
++        out.append(Fact(id=r[0], summary=r[1], salience=r[2],
++                        emotional_tone=r[3], entity_keys=list(r[4] or []),
++                        similarity=max(0.0, float(r[5]))))
++    return out
++
++
++def _fact_row_to_episode(r) -> Episode:
++    """Adapt a fact row into an Episode so the existing reranker/briefing (which
++    are episode-shaped) can consume facts unchanged in Phase 1."""
++    return Episode(
++        id=r[0], role="memory", content=r[1], salience=float(r[2]),
++        vitality=float(r[3]), tone=r[4], created_at=r[5],
++        similarity=max(0.0, float(r[6])),
++    )
++
++
++def fact_knn_candidates(conn: psycopg.Connection, query_embedding: List[float],
++                        k: int, only_current: bool = True) -> List[Episode]:
++    """Cast the nearest facts (as Episode adapters) for the briefing path."""
++    where = "embedding IS NOT NULL" + (" AND validity = 'current'" if only_current else "")
++    emb = _vec(query_embedding)
++    rows = conn.execute(
++        f"""
++        SELECT id, summary, salience, vitality, emotional_tone, created_at,
++               1 - (embedding <=> %s) AS similarity
++        FROM facts
++        WHERE {where}
++        ORDER BY embedding <=> %s
++        LIMIT %s
++        """,
++        (emb, emb, k),
++    ).fetchall()
++    return [_fact_row_to_episode(r) for r in rows]
++
++
++def merge_fact(conn: psycopg.Connection, target_id: int, content: str,
++               embedding: List[float], source_episode_id: Optional[int],
++               cues=None) -> None:
++    """MERGE: refresh an existing fact in place and extend its lineage."""
++    conn.execute(
++        """
++        UPDATE facts
++        SET summary = %s,
++            embedding = %s,
++            retrieval_cues = COALESCE(retrieval_cues, '{}') || %s,
++            cues_text = trim(both ' ' from COALESCE(cues_text,'') || ' ' || %s),
++            source_episode_ids = CASE WHEN %s IS NULL THEN source_episode_ids
++                ELSE COALESCE(source_episode_ids, '{}') || %s END,
++            confidence = least(1.0, confidence + 0.1),
++            updated_at = now()
++        WHERE id = %s
++        """,
++        (content, _vec(embedding), (cues or []), _cues_text(cues) or "",
++         source_episode_id, [source_episode_id] if source_episode_id else None,
++         target_id),
++    )
++
++
++def supersede_fact(conn: psycopg.Connection, old_id: int, new_id: int) -> None:
++    """UPDATE: retire the old fact, pointing it at the new current one."""
++    conn.execute(
++        """UPDATE facts
++           SET validity = 'outdated', valid_until = now(),
++               superseded_by = %s, updated_at = now()
++           WHERE id = %s""",
++        (new_id, old_id),
++    )
++
++
++def mark_fact_outdated(conn: psycopg.Connection, fact_id: int) -> None:
++    """DELETE (soft): the user retracted this fact; keep it but mark it outdated."""
++    conn.execute(
++        """UPDATE facts SET validity = 'outdated', valid_until = now(),
++               updated_at = now() WHERE id = %s""",
++        (fact_id,),
++    )
++
++
++def due_threads(conn: psycopg.Connection, within_days: int = 7) -> List[Episode]:
++    """Open threads (L-thread) whose due_date lands within the window — always
++    surfaced in the briefing regardless of retrieval score (Phase 1.6)."""
++    rows = conn.execute(
++        """
++        SELECT id, summary, salience, vitality, emotional_tone, created_at, 1.0
++        FROM facts
++        WHERE fact_type = 'thread' AND thread_status = 'unresolved'
++              AND validity = 'current' AND due_date IS NOT NULL
++              AND due_date <= now() + (%s || ' days')::interval
++              AND due_date >= now() - interval '1 day'
++        ORDER BY due_date ASC
++        """,
++        (within_days,),
++    ).fetchall()
++    return [_fact_row_to_episode(r) for r in rows]
++
++
+ # --------------------------------------------------------------------------- #
+ # Emotional timeline (L4)
+ # --------------------------------------------------------------------------- #
+diff --git a/taco/pipeline.py b/taco/pipeline.py
+index 94e58a3..2ddfb1d 100644
+--- a/taco/pipeline.py
++++ b/taco/pipeline.py
+@@ -5,11 +5,12 @@
+       → infer state S
+       → orchestrator resolves the six subsystems + the reasoning stance
+       → L9 predict trajectory (anticipatory prefetch when escalating)
+-      → cast 20 candidates (pgvector kNN) → re-rank by R(m) → top 4
+-      → L7 reconsolidate retrieved memories that are re-held from a changed state
++      → cast episode candidates → re-rank → L7 reconsolidate the re-held episodes
++      → cast FACT candidates → re-rank by R(m) → top-k (+ always-on open threads)
+       → assemble narrative briefing (stance + L10 self-model + L9 prediction)
+       → single reasoning-engine invocation
+-      → write-time salience gate (store or drop)
++      → write path: episodes gated by θ(S); facts gated by θ_facts(S), then
++        ADD/UPDATE/MERGE/DELETE/NOOP reconciliation against existing facts
+       → L10 consolidate identity from significant moments
+       → state + memory write-back  (feedback updates S)
+ """
+@@ -23,7 +24,8 @@ from typing import List, Optional
+ import psycopg
+ 
+ from . import config, embeddings, llm
+-from .memory import decay, identity, reconsolidation, retrieval, salience, store
++from .memory import (decay, extract, identity, operations, reconsolidation,
++                     retrieval, salience, store)
+ from .memory.episode import Episode
+ from .state import ContentSignal, LatentState, infer_state
+ from .subsystems import orchestrator, prediction
+@@ -42,6 +44,7 @@ class TurnResult:
+     briefing: str
+     prediction: Optional[PredictiveContinuity] = None
+     reconsolidated: int = 0
++    recon_beliefs: List[str] = field(default_factory=list)
+     identity_updates: List[identity.IdentityUpdate] = field(default_factory=list)
+ 
+ 
+@@ -65,13 +68,15 @@ class Taco:
+ 
+     def turn(self, user_message: str,
+              hours_since_last: Optional[float] = None) -> TurnResult:
+-        # 1. interoception: read the message's affect + salience in one call
+-        analysis = llm.analyze(user_message)
++        # 1. interoception + light extraction: affect + entities + cues in one call
++        light = extract.light_extract(user_message)
++        analysis = {"emotional": light.emotional, "vulnerability": light.vulnerability,
++                    "salience": light.salience, "tone": light.tone}
+ 
+         # 2. infer the new latent state S
+         gap = self._hours_since_last() if hours_since_last is None else hours_since_last
+-        signal = ContentSignal(emotional=analysis["emotional"],
+-                               vulnerability=analysis["vulnerability"])
++        signal = ContentSignal(emotional=light.emotional,
++                               vulnerability=light.vulnerability)
+         self.state = infer_state(self.state, signal, gap)
+ 
+         # 3. orchestrator resolves all six subsystems + the reasoning stance from S
+@@ -83,25 +88,30 @@ class Taco:
+         recent_salient = store.recent_salient_episodes(self.conn)
+         pred = prediction.predict(history, recent_salient)
+ 
+-        # 5. retrieval: cast → (state-gated anticipatory prefetch) → re-rank → top-k
++        # 5. retrieval. Episodes still feed L7 reconsolidation (they are the raw
++        #    affective record); FACTS are the retrieval target for the briefing.
+         q_emb = embeddings.embed_list(user_message)
+-        candidates = store.knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
+-        if pred.prefetch_query and pred.prefetch_query != user_message:
+-            seen = {c.id for c in candidates}
+-            pf_emb = embeddings.embed_list(pred.prefetch_query)
+-            for c in store.knn_candidates(self.conn, pf_emb, config.PREFETCH_K):
+-                if c.id not in seen:
+-                    candidates.append(c)
+-        top = retrieval.rerank(candidates, self.state, top_k=config.TOP_K)
+-        store.touch_access(self.conn, [m.id for m in top if m.id])
++        epi_cands = store.knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
++        top_epi = retrieval.rerank(epi_cands, self.state, top_k=config.TOP_K)
++        store.touch_access(self.conn, [m.id for m in top_epi if m.id])
+ 
+-        # 6. L7 reconsolidation: re-remembering a memory from a changed state
+-        #    rewrites its meaning and attenuates its charge (before beliefs are read).
++        # 6. L7 reconsolidation on the re-held episodes (before beliefs are read).
+         current_tone = retrieval.state_tone(self.state)
+         recon = reconsolidation.reconsolidate(
+-            self.conn, top, self.state, current_tone,
++            self.conn, top_epi, self.state, current_tone,
+             llm.reconsolidate, embeddings.embed_list)
+ 
++        # 6b. fact retrieval (+ state-gated anticipatory prefetch) → re-rank → top-k.
++        fact_cands = store.fact_knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
++        if pred.prefetch_query and pred.prefetch_query != user_message:
++            seen = {c.id for c in fact_cands}
++            pf_emb = embeddings.embed_list(pred.prefetch_query)
++            for c in store.fact_knn_candidates(self.conn, pf_emb, config.PREFETCH_K):
++                if c.id not in seen:
++                    fact_cands.append(c)
++        top = retrieval.rerank(fact_cands, self.state, top_k=config.TOP_K)
++        top = self._surface_threads(top)  # open threads always included (Phase 1.6)
++
+         beliefs = store.belief_candidates(self.conn, q_emb, k=2)
+         identity_lines = identity.snapshot_lines(self.conn)  # L10 self-model
+ 
+@@ -113,9 +123,12 @@ class Taco:
+         # 8. single reasoning-engine invocation
+         response = llm.respond(briefing, user_message, plan.planning_depth)
+ 
+-        # 9. write-time salience gate on the user's turn
++        # 9. write path. Episodes are gated by the emotional threshold θ(S); facts
++        #    by the lower informational gate θ_facts(S), so paraphrasable content
++        #    survives even when it carries little emotional charge.
+         stored = salience.gate(analysis["salience"], self.state)
+         identity_updates: List[identity.IdentityUpdate] = []
++        ep_id: Optional[int] = None
+         if stored:
+             ep = salience.build_episode("user", user_message, analysis)
+             ep_id = store.add_episode(self.conn, ep, q_emb, self.state)
+@@ -126,6 +139,10 @@ class Taco:
+                 self.conn, user_message, analysis["salience"], self.state,
+                 llm.extract_identity)
+ 
++        # 9b. extract + reconcile structured facts (ADD/UPDATE/MERGE/DELETE/NOOP).
++        if light.salience >= self.state.theta_facts():
++            self._write_facts(user_message, light, ep_id)
++
+         # 10. write-back: working memory + persisted state
+         self.working.append(Episode(content=user_message, role="user",
+                                     tone=analysis.get("tone")))
+@@ -136,8 +153,29 @@ class Taco:
+                           analysis=analysis, retrieved=top, stored=stored,
+                           briefing=briefing, prediction=pred,
+                           reconsolidated=recon.count,
++                          recon_beliefs=[b for _, b in recon.rewrites],
+                           identity_updates=identity_updates)
+ 
++    # ------------------------------------------------------------------ #
++    def _write_facts(self, user_message: str, light: "extract.LightExtract",
++                     source_episode_id: Optional[int]) -> None:
++        """Full-extract a salient turn and reconcile each fact against neighbours."""
++        full = extract.full_extract(user_message, light)
++        for fact in full.facts:
++            f_emb = embeddings.embed_list(fact.summary)
++            neighbors = store.fact_neighbors(self.conn, f_emb, k=3, min_sim=0.7)
++            action = operations.decide_action(fact, neighbors)
++            operations.apply(self.conn, action, fact, f_emb,
++                             source_episode_id, self.state)
++
++    def _surface_threads(self, top: List[Episode]) -> List[Episode]:
++        """Always include open threads due within 7 days, regardless of score."""
++        threads = store.due_threads(self.conn, within_days=7)
++        if not threads:
++            return top
++        have = {m.id for m in top}
++        return [t for t in threads if t.id not in have] + top
++
+     # ------------------------------------------------------------------ #
+     def probe(self, user_message: str) -> TurnResult:
+         """Read-only turn: infer state and retrieve/respond WITHOUT writing back.
+@@ -146,9 +184,11 @@ class Taco:
+         probe's own affect still transiently shapes S (state modulates retrieval),
+         but nothing is persisted.
+         """
+-        analysis = llm.analyze(user_message)
+-        signal = ContentSignal(emotional=analysis["emotional"],
+-                               vulnerability=analysis["vulnerability"])
++        light = extract.light_extract(user_message)
++        analysis = {"emotional": light.emotional, "vulnerability": light.vulnerability,
++                    "salience": light.salience, "tone": light.tone}
++        signal = ContentSignal(emotional=light.emotional,
++                               vulnerability=light.vulnerability)
+         state = infer_state(self.state, signal, 0.5)  # transient, not persisted
+         plan = orchestrator.plan(state)
+ 
+@@ -156,8 +196,8 @@ class Taco:
+         pred = prediction.predict(history, store.recent_salient_episodes(self.conn))
+ 
+         q_emb = embeddings.embed_list(user_message)
+-        candidates = store.knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
+-        top = retrieval.rerank(candidates, state, top_k=config.TOP_K)
++        fact_cands = store.fact_knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
++        top = self._surface_threads(retrieval.rerank(fact_cands, state, top_k=config.TOP_K))
+         beliefs = store.belief_candidates(self.conn, q_emb, k=2)
+         identity_lines = identity.snapshot_lines(self.conn)
+         briefing = retrieval.assemble_briefing(
+diff --git a/taco/state.py b/taco/state.py
+index 8111da9..922a3f9 100644
+--- a/taco/state.py
++++ b/taco/state.py
+@@ -69,6 +69,15 @@ class LatentState:
+         theta = base + (config.THETA_MAX - base) * engagement_penalty * 0.5
+         return round(max(config.THETA_MIN, min(config.THETA_MAX, theta)), 2)
+ 
++    def theta_facts(self) -> float:
++        """Lower, informational gate for extracted facts (vs. the emotional θ).
++
++        Facts are the retrieval target, so paraphrasable low-arousal content (a
++        name, a plan, a preference) should survive even when emotional charge is
++        low. Sits a fixed step below θ(S) with a hard floor.
++        """
++        return max(1.5, self.theta() - 2.0)
++
+     # ---- §4.2  emotional retrieval weight w_emo(V) ------------------------ #
+     def w_emo(self) -> float:
+         """Emotional retrieval weight, rises linearly with V from 0.20→0.48 (Fig 7a)."""
+diff --git a/tests/test_retrieval.py b/tests/test_retrieval.py
+index 0c735d9..04f8440 100644
+--- a/tests/test_retrieval.py
++++ b/tests/test_retrieval.py
+@@ -47,9 +47,11 @@ def test_rerank_selects_top_k_by_score():
+         _ep(content="mid", similarity=0.5, salience=5, tone="concerned"),
+         _ep(content="emo match", similarity=0.3, salience=6, tone="distress"),
+         _ep(content="filler", similarity=0.2, salience=1, tone="neutral"),
++        _ep(content="extra a", similarity=0.4, salience=3, tone="neutral"),
++        _ep(content="extra b", similarity=0.15, salience=2, tone="neutral"),
+     ]
+     top = retrieval.rerank(cands, s, top_k=config.TOP_K)
+-    assert len(top) == config.TOP_K
++    assert len(top) == config.TOP_K  # more candidates than TOP_K → returns exactly TOP_K
+     # scores are sorted descending
+     assert all(top[i].score >= top[i + 1].score for i in range(len(top) - 1))
+     # the strongest candidate wins
+diff --git a/taco/memory/fact.py b/taco/memory/fact.py
+new file mode 100644
+index 0000000..a81e0d1
+--- /dev/null
++++ b/taco/memory/fact.py
+@@ -0,0 +1,37 @@
++"""The Fact record — the structured retrieval unit (Phase 1).
++
++Episodes ([`episode.py`](episode.py)) remain the raw conversational record that
++feeds the L4 emotional timeline and L7 reconsolidation. Facts are *extracted*
++from those turns: deduplicated, paraphrase-retrievable units carrying rich
++emotional and entity metadata. From Phase 1 on, facts — not episodes — are the
++primary thing retrieval surfaces into the briefing.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from datetime import datetime
++from typing import List, Optional
++
++
++@dataclass
++class Fact:
++    """One structured memory. Mirrors a row of the `facts` table."""
++
++    summary: str
++    fact_type: Optional[str] = None        # preference|event|relationship|state|thread
++    event_type: Optional[str] = None       # conflict|goal|fear|plan|achievement|...
++    emotional_tone: Optional[str] = None
++    emotional_cause: Optional[str] = None   # TACO-specific: why it carries charge
++    user_belief: Optional[str] = None       # TACO-specific: the self-belief it implies
++    salience: float = 1.0
++    retrieval_cues: List[str] = field(default_factory=list)   # alt phrasings (≤3)
++    entity_keys: List[str] = field(default_factory=list)      # "person:maya", ...
++    validity: str = "current"               # current|outdated|uncertain|resolved
++    thread_status: Optional[str] = None     # unresolved|in_progress|resolved
++    due_date: Optional[datetime] = None
++    confidence: float = 0.7
++
++    # populated only when read back from storage
++    id: Optional[int] = None
++    created_at: Optional[datetime] = None
++    similarity: float = 0.0   # cosine similarity from a candidate / neighbour query
+diff --git a/taco/memory/extract.py b/taco/memory/extract.py
+new file mode 100644
+index 0000000..425b5b3
+--- /dev/null
++++ b/taco/memory/extract.py
+@@ -0,0 +1,279 @@
++"""Tiered fact extraction (Phase 1).
++
++Two tiers keep cost bounded — every BYO-key user pays for each LLM call:
++
++  • `light_extract` runs on EVERY turn. One cheap JSON call reads affect
++    (emotional / vulnerability / salience / tone) plus a couple of entities and
++    retrieval cues. It replaces the old standalone `llm.analyze` in the pipeline.
++
++  • `full_extract` runs only when a turn is salient enough to be worth storing as
++    structured facts. It produces the rich schema — `emotional_cause`,
++    `user_belief`, `event_type`, capped `retrieval_cues`, open-thread fields —
++    the signals that make a fact retrievable across paraphrased future queries.
++
++Both tiers fall back to deterministic heuristics under TACO_MOCK=1 so the whole
++pipeline runs keyless; with a key but TACO_MOCK unset they fail loud (see
++`llm.available`).
++"""
++from __future__ import annotations
++
++import json
++import re
++from dataclasses import dataclass, field
++from typing import Dict, List, Optional
++
++from .. import config, llm
++from ..retry import with_retries
++from .fact import Fact
++
++
++@dataclass
++class LightExtract:
++    """Cheap per-turn read: affect + a few entities + ≤2 retrieval cues."""
++    emotional: float
++    vulnerability: float
++    salience: float
++    tone: str
++    entities: List[str] = field(default_factory=list)
++    retrieval_cues: List[str] = field(default_factory=list)
++
++
++@dataclass
++class FullExtract:
++    """The structured facts pulled from a salient turn."""
++    facts: List[Fact] = field(default_factory=list)
++
++
++# --------------------------------------------------------------------------- #
++# Heuristic fallbacks (TACO_MOCK=1) — deterministic, keyless
++# --------------------------------------------------------------------------- #
++_REL_ROLES = (
++    "partner", "wife", "husband", "girlfriend", "boyfriend", "fiancé", "fiancee",
++    "mother", "mom", "father", "dad", "son", "daughter", "sister", "brother",
++    "friend", "boss", "manager", "therapist", "doctor", "roommate", "cofounder",
++)
++
++# keyword → a reformulated cue someone might later use to ask about this
++_CUE_MAP = (
++    (("died", "passed away", "funeral", "heart attack"), "grief over losing someone"),
++    (("breakup", "broke up", "broke it off"), "the breakup"),
++    (("divorce",), "the divorce"),
++    (("laid off", "fired", "let go", "lost my job"), "losing the job"),
++    (("interview",), "interview anxiety"),
++    (("diagnos", "cancer", "metformin", "diabetes"), "the health diagnosis"),
++    (("relapse", "sober", "quit drinking", "recovery"), "the recovery struggle"),
++    (("fraud", "imposter", "not good enough", "failing"), "feeling not good enough"),
++    (("promotion", "got the job", "raise"), "the career win"),
++)
++
++_EVENT_KEYWORDS = (
++    (("died", "passed away", "funeral", "heart attack", "diagnos"), "health"),
++    (("breakup", "broke up", "divorce", "partner", "marriage"), "relationship"),
++    (("laid off", "fired", "promotion", "job", "interview", "work"), "goal"),
++    (("scared", "terrified", "anxious", "afraid", "worried"), "fear"),
++    (("fight", "argument", "conflict", "criticized"), "conflict"),
++    (("plan", "going to", "next week", "tomorrow", "friday"), "plan"),
++)
++
++# A thread = a future time cue AND a commitment/event noun (so "interview on
++# friday" is a thread but "post office hours on fridays" is not).
++_THREAD_TIME = ("tomorrow", "tonight", "this weekend", "next week", "monday",
++                "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
++_THREAD_NOUN = ("interview", "meeting", "appointment", "exam", "midterm", "deadline",
++                "surgery", "date", "trip", "wedding", "presentation", "review",
++                "funeral", "hearing", "court", "ceremony", "call")
++
++
++def _is_thread(text: str) -> bool:
++    t = text.lower()
++    return any(c in t for c in _THREAD_TIME) and any(n in t for n in _THREAD_NOUN)
++
++
++def _heuristic_entities(text: str) -> List[str]:
++    out: List[str] = []
++    roles = "|".join(_REL_ROLES)
++    for m in re.finditer(rf"\bmy ({roles})\b(?:[, ]+(?:named|called)\s+)?\s*([A-Z][a-z]+)?",
++                         text):
++        out.append(f"relationship:{m.group(1).lower()}")
++        if m.group(2):
++            out.append(f"person:{m.group(2).lower()}")
++    # standalone proper nouns (not sentence-initial) as coarse entities
++    for m in re.finditer(r"(?<!^)(?<![.!?]\s)\b([A-Z][a-z]{2,})\b", text):
++        tok = m.group(1).lower()
++        if tok not in ("i", "i'm") and f"person:{tok}" not in out:
++            out.append(f"entity:{tok}")
++    # de-dup, cap
++    seen, uniq = set(), []
++    for e in out:
++        if e not in seen:
++            seen.add(e); uniq.append(e)
++    return uniq[:5]
++
++
++def _heuristic_cues(text: str, limit: int) -> List[str]:
++    t = text.lower()
++    cues: List[str] = []
++    for keys, cue in _CUE_MAP:
++        if any(k in t for k in keys) and cue not in cues:
++            cues.append(cue)
++        if len(cues) >= limit:
++            break
++    return cues[:limit]
++
++
++def _heuristic_event_type(text: str) -> str:
++    t = text.lower()
++    for keys, et in _EVENT_KEYWORDS:
++        if any(k in t for k in keys):
++            return et
++    return "event"
++
++
++def _heuristic_light(text: str) -> LightExtract:
++    a = llm._heuristic_analyze(text)
++    return LightExtract(
++        emotional=a["emotional"], vulnerability=a["vulnerability"],
++        salience=a["salience"], tone=a["tone"],
++        entities=_heuristic_entities(text),
++        retrieval_cues=_heuristic_cues(text, limit=2),
++    )
++
++
++def _heuristic_full(text: str, light: LightExtract) -> FullExtract:
++    is_thread = _is_thread(text)
++    fact = Fact(
++        summary=text.strip(),
++        fact_type="thread" if is_thread else "event",
++        event_type=_heuristic_event_type(text),
++        emotional_tone=light.tone,
++        salience=light.salience,
++        retrieval_cues=_heuristic_cues(text, limit=3),
++        entity_keys=light.entities,
++        thread_status="unresolved" if is_thread else None,
++        confidence=0.6,
++    )
++    return FullExtract(facts=[fact])
++
++
++# --------------------------------------------------------------------------- #
++# LLM tiers
++# --------------------------------------------------------------------------- #
++_LIGHT_SYS = (
++    "You are the interoceptive sensor and entity tagger of a cognitive memory "
++    "layer. Read the user's message and respond with strict JSON only:\n"
++    '{"emotional": <0-100>, "vulnerability": <0-100>, "salience": <1-10>, '
++    '"tone": "<one lowercase word>", "entities": ["type:value", ...], '
++    '"retrieval_cues": ["...", "..."]}\n'
++    "emotional = affective arousal; vulnerability = openness/fragility/disclosure; "
++    "salience = worth remembering long-term (10=breakup/death/identity, 1=small talk). "
++    "entities are typed keys like person:maya, role:interview, org:nimbus, place:lisbon. "
++    "retrieval_cues are AT MOST 2 alternative ways someone might later ask about this "
++    "— reformulations of the underlying meaning, not synonyms of the words used."
++)
++
++_FULL_SYS = (
++    "You extract durable, structured FACTS from a user's message for a long-term "
++    "memory system. Return strict JSON: {\"facts\": [ {...}, ... ]}. Produce 1-3 "
++    "facts; fewer is better. Each fact:\n"
++    '{"summary": "<third-person, durable statement>", '
++    '"fact_type": "preference|event|relationship|state|thread", '
++    '"event_type": "conflict|goal|preference|fear|plan|relationship|achievement|failure|health|money|identity|thread", '
++    '"emotional_tone": "<word>", '
++    '"emotional_cause": "<why it carries emotional charge, or empty>", '
++    '"user_belief": "<the self-belief it implies, e.g. \'I mess up opportunities\', or empty>", '
++    '"retrieval_cues": ["<alt phrasing>", ...], '
++    '"entity_keys": ["type:value", ...], '
++    '"validity": "current|outdated|uncertain", '
++    '"thread_status": "unresolved|in_progress|resolved or null", '
++    '"due_date": "<ISO date if there is a future commitment/deadline, else null>"}\n'
++    "retrieval_cues: AT MOST 3 reformulations of the meaning someone might ask about "
++    "later (not word synonyms). Use fact_type='thread' with thread_status='unresolved' "
++    "for an open loop with a future action or time (e.g. an upcoming interview)."
++)
++
++
++def light_extract(text: str) -> LightExtract:
++    """Cheap per-turn extraction. Heuristic under TACO_MOCK=1, else one LLM call."""
++    if not llm.available():
++        return _heuristic_light(text)
++    resp = with_retries(lambda: llm._client().chat.completions.create(
++        model=config.LLM_MODEL,
++        messages=[{"role": "system", "content": _LIGHT_SYS},
++                  {"role": "user", "content": text}],
++        temperature=0,
++        response_format={"type": "json_object"},
++    ))
++    try:
++        d = json.loads(resp.choices[0].message.content)
++    except Exception:
++        return _heuristic_light(text)
++    return LightExtract(
++        emotional=float(d.get("emotional", 0)),
++        vulnerability=float(d.get("vulnerability", 0)),
++        salience=max(1.0, min(10.0, float(d.get("salience", 1)))),
++        tone=str(d.get("tone", "neutral")),
++        entities=[str(e) for e in (d.get("entities") or [])][:5],
++        retrieval_cues=[str(c) for c in (d.get("retrieval_cues") or [])][:2],
++    )
++
++
++def full_extract(text: str, light: LightExtract) -> FullExtract:
++    """Rich extraction for salient turns. Heuristic under TACO_MOCK=1, else one call."""
++    if not llm.available():
++        return _heuristic_full(text, light)
++    resp = with_retries(lambda: llm._client().chat.completions.create(
++        model=config.LLM_MODEL,
++        messages=[{"role": "system", "content": _FULL_SYS},
++                  {"role": "user", "content": text}],
++        temperature=0.2,
++        response_format={"type": "json_object"},
++    ))
++    try:
++        raw = json.loads(resp.choices[0].message.content).get("facts", [])
++    except Exception:
++        return _heuristic_full(text, light)
++    facts: List[Fact] = []
++    for f in raw:
++        summary = str(f.get("summary", "")).strip()
++        if not summary:
++            continue
++        facts.append(_fact_from_json(f, light))
++    return FullExtract(facts=facts or _heuristic_full(text, light).facts)
++
++
++def _fact_from_json(f: Dict, light: LightExtract) -> Fact:
++    due = f.get("due_date")
++    return Fact(
++        summary=str(f["summary"]).strip(),
++        fact_type=_clean(f.get("fact_type")) or "event",
++        event_type=_clean(f.get("event_type")),
++        emotional_tone=_clean(f.get("emotional_tone")) or light.tone,
++        emotional_cause=_clean(f.get("emotional_cause")),
++        user_belief=_clean(f.get("user_belief")),
++        salience=light.salience,
++        retrieval_cues=[str(c) for c in (f.get("retrieval_cues") or [])][:3],
++        entity_keys=[str(e) for e in (f.get("entity_keys") or [])][:6],
++        validity=_clean(f.get("validity")) or "current",
++        thread_status=_clean(f.get("thread_status")),
++        due_date=_parse_iso(due) if due else None,
++        confidence=0.7,
++    )
++
++
++def _clean(v) -> Optional[str]:
++    """Normalise model output: empty/null-ish strings → None."""
++    if v is None:
++        return None
++    s = str(v).strip()
++    if not s or s.lower() in ("null", "none", "n/a", ""):
++        return None
++    return s
++
++
++def _parse_iso(v):
++    from datetime import datetime, timezone
++    try:
++        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
++        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
++    except Exception:
++        return None
+diff --git a/taco/memory/operations.py b/taco/memory/operations.py
+new file mode 100644
+index 0000000..4404854
+--- /dev/null
++++ b/taco/memory/operations.py
+@@ -0,0 +1,135 @@
++"""Fact write operations (Phase 1).
++
++After a fact is extracted, it is not blindly inserted. `decide_action` compares
++it against its nearest existing neighbours and chooses one of:
++
++    ADD     — genuinely new information
++    UPDATE  — supersedes an existing fact (job change, moved city); the old fact
++              is kept but marked outdated and linked via `superseded_by`
++    MERGE   — same fact with extra detail; updated in place, lineage extended
++    DELETE  — the user explicitly retracted/contradicted a prior fact (rare)
++    NOOP    — an exact duplicate; nothing to do
++
++This is what lets the briefing surface the *current* state (Case B in the brief)
++instead of piling up contradictory near-duplicates the way naive RAG does.
++"""
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from typing import List, Optional
++
++import psycopg
++
++from .. import config, llm
++from ..retry import with_retries
++from ..state import LatentState
++from . import store
++from .fact import Fact
++
++ADD, UPDATE, DELETE, MERGE, NOOP = "ADD", "UPDATE", "DELETE", "MERGE", "NOOP"
++_VALID = {ADD, UPDATE, DELETE, MERGE, NOOP}
++
++# Heuristic similarity bands (TACO_MOCK=1): how close a neighbour must be.
++_DUP_SIM = 0.97     # ≥ this → exact duplicate → NOOP
++_MERGE_SIM = 0.88   # ≥ this → same fact, extra detail → MERGE
++
++
++@dataclass
++class Action:
++    kind: str
++    target_id: Optional[int] = None
++    content: Optional[str] = None
++
++
++def _heuristic_action(new_fact: Fact, neighbors: List[Fact]) -> Action:
++    top = neighbors[0]
++    if top.similarity >= _DUP_SIM:
++        return Action(NOOP, target_id=top.id)
++    if top.similarity >= _MERGE_SIM:
++        return Action(MERGE, target_id=top.id, content=new_fact.summary)
++    return Action(ADD)
++
++
++_SYS = (
++    "You maintain a deduplicated long-term memory. Given a NEW candidate fact and "
++    "its nearest EXISTING facts (with ids), decide the single best write action. "
++    "Respond with strict JSON: {\"action\": \"ADD|UPDATE|DELETE|MERGE|NOOP\", "
++    "\"target_id\": <id or null>, \"content\": \"<merged/updated summary or null>\"}.\n"
++    "ADD: genuinely new. UPDATE: the new fact supersedes an existing one (the user's "
++    "situation changed — job, city, status); set target_id to the superseded fact and "
++    "content to the new summary. MERGE: same fact with extra detail; set target_id and "
++    "a combined content. DELETE: the user explicitly retracted/contradicted an existing "
++    "fact with no replacement; set target_id. NOOP: an exact duplicate. Prefer ADD when "
++    "unsure. Only choose DELETE when the contradiction is explicit."
++)
++
++
++def decide_action(new_fact: Fact, neighbors: List[Fact]) -> Action:
++    """Pick a write action for `new_fact` given its nearest neighbours.
++
++    No neighbours → trivially ADD (skips the LLM call entirely — the common case
++    for novel facts, which matters under rate limits). Otherwise heuristic under
++    TACO_MOCK=1, else one LLM judgement.
++    """
++    if not neighbors:
++        return Action(ADD)
++    if not llm.available():
++        return _heuristic_action(new_fact, neighbors)
++
++    listing = "\n".join(
++        f"  id={n.id} (sim={n.similarity:.2f}): {n.summary}" for n in neighbors
++    )
++    user = f"NEW: {new_fact.summary}\nEXISTING:\n{listing}"
++    try:
++        resp = with_retries(lambda: llm._client().chat.completions.create(
++            model=config.LLM_MODEL,
++            messages=[{"role": "system", "content": _SYS},
++                      {"role": "user", "content": user}],
++            temperature=0,
++            response_format={"type": "json_object"},
++        ))
++        d = json.loads(resp.choices[0].message.content)
++    except Exception:
++        return _heuristic_action(new_fact, neighbors)
++
++    kind = str(d.get("action", ADD)).upper()
++    if kind not in _VALID:
++        return Action(ADD)
++    target = d.get("target_id")
++    target_id = int(target) if isinstance(target, (int, float)) or (
++        isinstance(target, str) and target.isdigit()) else None
++    # actions that need a target but didn't get a valid one degrade to ADD
++    if kind in (UPDATE, DELETE, MERGE) and target_id is None:
++        return Action(ADD)
++    content = d.get("content")
++    return Action(kind, target_id=target_id,
++                  content=str(content) if content else None)
++
++
++def apply(conn: psycopg.Connection, action: Action, fact: Fact,
++          embedding: List[float], source_episode_id: Optional[int],
++          state: Optional[LatentState] = None) -> Optional[int]:
++    """Execute `action`. Returns the id of the resulting current fact (or None)."""
++    if action.kind == NOOP:
++        return action.target_id
++
++    if action.kind == MERGE and action.target_id is not None:
++        store.merge_fact(conn, action.target_id,
++                         action.content or fact.summary, embedding,
++                         source_episode_id, fact.retrieval_cues)
++        return action.target_id
++
++    if action.kind == DELETE and action.target_id is not None:
++        store.mark_fact_outdated(conn, action.target_id)
++        return None
++
++    if action.kind == UPDATE and action.target_id is not None:
++        if action.content:
++            fact.summary = action.content
++        new_id = store.add_fact(conn, fact, embedding, source_episode_id, state)
++        store.supersede_fact(conn, action.target_id, new_id)
++        return new_id
++
++    # ADD (and any degraded case)
++    return store.add_fact(conn, fact, embedding, source_episode_id, state)
+diff --git a/tests/test_extract.py b/tests/test_extract.py
+new file mode 100644
+index 0000000..c902602
+--- /dev/null
++++ b/tests/test_extract.py
+@@ -0,0 +1,56 @@
++"""Tiered extraction: light on every turn, full only on salient turns (Phase 1).
++
++These exercise the keyless heuristic path (TACO_MOCK), so they are deterministic
++and need no API key or database.
++"""
++import pytest
++
++from taco import config
++from taco.memory import extract
++
++
++@pytest.fixture(autouse=True)
++def _mock(monkeypatch):
++    monkeypatch.setattr(config, "MOCK", True)
++
++
++def test_light_extract_returns_affect_entities_cues():
++    le = extract.light_extract("my partner Maya and I broke up last night")
++    assert 0 <= le.emotional <= 100
++    assert 0 <= le.vulnerability <= 100
++    assert 1 <= le.salience <= 10
++    assert isinstance(le.entities, list)
++    assert isinstance(le.retrieval_cues, list)
++    assert len(le.retrieval_cues) <= 2          # light tier caps cues at 2
++    # the relationship / named partner is tagged as an entity
++    assert any("maya" in e or "partner" in e for e in le.entities)
++
++
++def test_light_cues_capped_at_two():
++    le = extract.light_extract("my dad died, I got laid off, and I relapsed drinking")
++    assert len(le.retrieval_cues) <= 2
++
++
++def test_full_extract_emits_rich_fact_on_disclosure():
++    text = "my dad passed away last night, a heart attack"
++    le = extract.light_extract(text)
++    fe = extract.full_extract(text, le)
++    assert len(fe.facts) >= 1
++    f = fe.facts[0]
++    assert f.summary
++    assert f.salience == le.salience            # salience carried from the light tier
++    assert len(f.retrieval_cues) <= 3           # full tier caps cues at 3
++    assert f.event_type                          # classified, not blank
++
++
++def test_full_extract_flags_open_thread():
++    text = "I have an interview on friday and I want help preparing"
++    le = extract.light_extract(text)
++    fe = extract.full_extract(text, le)
++    assert any(f.fact_type == "thread" and f.thread_status == "unresolved"
++               for f in fe.facts)
++
++
++def test_transactional_turn_is_low_salience():
++    le = extract.light_extract("what time does the post office close on fridays?")
++    assert le.salience < 4                        # filler should not clear θ_facts
+diff --git a/tests/test_operations.py b/tests/test_operations.py
+new file mode 100644
+index 0000000..4e94ba2
+--- /dev/null
++++ b/tests/test_operations.py
+@@ -0,0 +1,116 @@
++"""Fact write operations: ADD / UPDATE / MERGE / DELETE / NOOP (Phase 1).
++
++`decide_action`'s heuristic is pure and always runs. The lifecycle test exercises
++the real store mutations and is skipped when no Postgres test DB is reachable.
++"""
++import os
++
++import pytest
++
++from taco import config, db
++from taco.memory import operations, store
++from taco.memory.fact import Fact
++from taco.memory.operations import ADD, DELETE, MERGE, NOOP, UPDATE
++
++TEST_DSN = os.getenv("TACO_TEST_DSN", "postgresql://localhost:5432/taco_eval")
++
++
++# --------------------------------------------------------------------------- #
++# decide_action heuristic (no DB, no API)
++# --------------------------------------------------------------------------- #
++@pytest.fixture(autouse=True)
++def _mock(monkeypatch):
++    monkeypatch.setattr(config, "MOCK", True)
++
++
++def _neighbor(fid, sim):
++    return Fact(id=fid, summary="existing fact", similarity=sim)
++
++
++def test_no_neighbors_is_add():
++    assert operations.decide_action(Fact(summary="new"), []).kind == ADD
++
++
++def test_exact_duplicate_is_noop():
++    a = operations.decide_action(Fact(summary="dup"), [_neighbor(1, 0.985)])
++    assert a.kind == NOOP and a.target_id == 1
++
++
++def test_close_match_merges():
++    a = operations.decide_action(Fact(summary="extra detail"), [_neighbor(2, 0.90)])
++    assert a.kind == MERGE and a.target_id == 2
++
++
++def test_distinct_neighbor_still_adds():
++    # a neighbour above the 0.7 floor but below the merge band is still new info
++    assert operations.decide_action(Fact(summary="diff"), [_neighbor(3, 0.74)]).kind == ADD
++
++
++# --------------------------------------------------------------------------- #
++# store round-trip (needs a Postgres test DB; skipped otherwise)
++# --------------------------------------------------------------------------- #
++@pytest.fixture()
++def conn():
++    try:
++        db.init_db(TEST_DSN)
++        c = db.connect(TEST_DSN)
++        c.execute("TRUNCATE facts RESTART IDENTITY")
++    except Exception as e:  # noqa: BLE001
++        pytest.skip(f"no Postgres test DB available: {e}")
++    yield c
++    try:
++        c.execute("TRUNCATE facts RESTART IDENTITY")
++        c.close()
++    except Exception:
++        pass
++
++
++def _emb(idx: int):
++    v = [0.0] * config.EMBED_DIM
++    v[idx] = 1.0
++    return v
++
++
++def test_fact_lifecycle(conn):
++    # ADD two orthogonal facts
++    id1 = operations.apply(conn, operations.Action(ADD),
++                           Fact(summary="User wants to become a lawyer", salience=6),
++                           _emb(0), None)
++    id2 = operations.apply(conn, operations.Action(ADD),
++                           Fact(summary="User has a dog named Max", salience=5),
++                           _emb(1), None)
++    assert id1 and id2
++
++    # neighbours near e0 find the lawyer fact
++    nb = store.fact_neighbors(conn, _emb(0), k=3, min_sim=0.7)
++    assert any(n.id == id1 for n in nb)
++
++    # UPDATE: the career change supersedes the lawyer fact
++    new = Fact(summary="User is building AI memory infra, no longer law", salience=7)
++    rid = operations.apply(conn, operations.Action(UPDATE, target_id=id1,
++                                                   content=new.summary),
++                           new, _emb(0), None)
++    assert rid and rid != id1
++    validity, superseded_by = conn.execute(
++        "SELECT validity, superseded_by FROM facts WHERE id=%s", (id1,)).fetchone()
++    assert validity == "outdated" and superseded_by == rid
++
++    # only_current retrieval drops the outdated fact, keeps the new one
++    ids = {e.id for e in store.fact_knn_candidates(conn, _emb(0), k=5, only_current=True)}
++    assert id1 not in ids and rid in ids
++
++    # MERGE: extra detail folds into the dog fact in place (no new row)
++    before = conn.execute("SELECT count(*) FROM facts").fetchone()[0]
++    operations.apply(conn, operations.Action(MERGE, target_id=id2,
++                     content="User has a labradoodle named Max who ate the couch"),
++                     Fact(summary="Max ate the couch"), _emb(1), 7)
++    after = conn.execute("SELECT count(*) FROM facts").fetchone()[0]
++    assert after == before
++    assert "labradoodle" in conn.execute(
++        "SELECT summary FROM facts WHERE id=%s", (id2,)).fetchone()[0]
++
++    # DELETE: soft-retire the dog fact
++    operations.apply(conn, operations.Action(DELETE, target_id=id2),
++                     Fact(summary="x"), _emb(1), None)
++    assert conn.execute(
++        "SELECT validity FROM facts WHERE id=%s", (id2,)).fetchone()[0] == "outdated"

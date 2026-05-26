@@ -99,6 +99,22 @@ def _client():
     return OpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
 
 
+def available() -> bool:
+    """Whether a real LLM should be used for this call.
+
+    False under TACO_MOCK=1 (use heuristics). True when a key is present.
+    Raises if no key is configured and mocking was not requested — the same
+    fail-loud contract as `analyze`, so cognition never silently degrades.
+    """
+    if config.MOCK:
+        return False
+    if not config.OPENAI_API_KEY:
+        raise RuntimeError(
+            "No API key configured — set OPENAI_API_KEY or TACO_MOCK=1 explicitly"
+        )
+    return True
+
+
 def analyze(text: str) -> Dict:
     """Return {emotional, vulnerability, salience, tone} for one turn.
 
@@ -106,8 +122,12 @@ def analyze(text: str) -> Dict:
     write-time salience gate (1–10), which is more token-efficient than two
     separate judge calls (§6.1 token-efficiency argument).
     """
-    if config.MOCK or not config.OPENAI_API_KEY:
+    if config.MOCK:
         return _heuristic_analyze(text)
+    if not config.OPENAI_API_KEY:
+        raise RuntimeError(
+            "No API key configured — set OPENAI_API_KEY or TACO_MOCK=1 explicitly"
+        )
 
     sys = (
         "You are the interoceptive sensor of a cognitive memory layer. Read the "

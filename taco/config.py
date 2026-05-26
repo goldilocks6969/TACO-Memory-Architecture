@@ -61,7 +61,7 @@ EMO_TONE_MATCH_BOOST = 0.30  # +0.3 if memory tone matches current user tone
 RECENCY_WINDOW_DAYS = 30     # rec(m) is recency within a 30-day window
 
 CANDIDATE_CAST = 20  # pgvector kNN candidates (Figure 4 step 1)
-TOP_K = 4            # memories assembled into the briefing (Figure 4 step 3)
+TOP_K = 6            # memories assembled into the briefing (Figure 4 step 3)
 
 
 # --------------------------------------------------------------------------- #

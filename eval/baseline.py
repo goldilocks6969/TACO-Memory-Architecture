@@ -16,7 +16,7 @@ difference is the memory policy.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import numpy as np
 
@@ -46,17 +46,32 @@ class NaiveRAG:
         idx = np.argsort(-sims)[: self.k]
         return [self._chunks[i] for i in idx]
 
-    def build_context(self, passages: List[str]) -> str:
-        header = ("You are a helpful assistant. The following are raw excerpts "
-                  "from earlier conversation, retrieved by similarity. Use any "
-                  "that are relevant.\n\nRetrieved conversation log:")
+    _SYSTEM_PROMPT = (
+        "You are a helpful assistant. The following are raw excerpts "
+        "from earlier conversation, retrieved by similarity. Use any "
+        "that are relevant."
+    )
+
+    def build_sections(self, passages: List[str]) -> Dict[str, str]:
+        """Return the RAG prompt broken into ``system`` and ``retrieval`` sections.
+
+        The state-briefing slot is intentionally empty: a naive RAG injects no
+        structured state. The harness reads these to attribute tokens the same
+        way it does for Taco.
+        """
         body = "\n".join(f"[{i+1}] {p}" for i, p in enumerate(passages)) or "(none)"
-        return f"{header}\n{body}"
+        retrieval_block = f"Retrieved conversation log:\n{body}"
+        return {"system": self._SYSTEM_PROMPT, "state": "", "retrieval": retrieval_block}
+
+    def build_context(self, passages: List[str]) -> str:
+        s = self.build_sections(passages)
+        return f"{s['system']}\n\n{s['retrieval']}"
 
     def answer(self, query: str, ntok: Callable[[str], int]) -> Tuple:
-        """Return (response, total_context, retrieval_tokens, n_memories, passages)."""
+        """Return (response, sections, retrieval_tokens, n_memories, passages)."""
         passages = self.retrieve(query)
-        context = self.build_context(passages)
+        sections = self.build_sections(passages)
+        context = f"{sections['system']}\n\n{sections['retrieval']}"
         response = llm.respond(context, query, planning_depth=1)
         retrieval_tokens = sum(ntok(p) for p in passages)
-        return response, context, retrieval_tokens, len(passages), passages
+        return response, sections, retrieval_tokens, len(passages), passages

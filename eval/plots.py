@@ -113,22 +113,100 @@ def tokens_chart(agg, out):
     p = out / "tokens.png"; fig.savefig(p); plt.close(fig); return p
 
 
-def ces_chart(agg, out):
+def _single_metric_chart(agg, out, *, key: str, filename: str, title: str,
+                          ylabel: str, caption: str):
+    """Generic two-bar (RAG vs Taco) chart for a single scalar in *agg[key]*."""
     fig, ax = plt.subplots(figsize=(6, 5))
-    vals = [agg["ces"][c] for c in ("rag", "taco")]
-    ymax = max(vals)
+    vals = [agg[key][c] if agg[key].get(c) is not None else 0.0 for c in ("rag", "taco")]
+    ymax = max(vals) or 1.0
     for i, c in enumerate(("rag", "taco")):
         ax.bar(i, vals[i], 0.55, label=LABEL[c], **STYLE[c])
         ax.text(i, vals[i] + ymax * 0.02, f"{vals[i]:.0f}", ha="center",
                 va="bottom", fontweight="bold", fontsize=12)
-    ax.set_xticks([0, 1]); ax.set_xticklabels([LABEL[c].replace(" + ", "\n+ ") for c in ("rag", "taco")])
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels([LABEL[c].replace(" + ", "\n+ ") for c in ("rag", "taco")])
     ax.set_ylim(0, ymax * 1.2)
-    ax.set_ylabel("Continuity per 1,000 retrieval tokens")
-    ax.set_title("Continuity Efficiency Score (CES)")
-    ax.text(0.5, -0.16, "CES = continuity quality ÷ retrieval tokens. Higher = "
-            "more continuity delivered per unit of retrieval overhead.",
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.text(0.5, -0.16, caption, transform=ax.transAxes, ha="center",
+            fontsize=8.5, color="#444444")
+    p = out / filename; fig.savefig(p); plt.close(fig); return p
+
+
+def ces_retrieval_chart(agg, out):
+    return _single_metric_chart(
+        agg, out, key="ces_retrieval", filename="ces_retrieval.png",
+        title="CES_retrieval — efficiency vs. retrieval payload",
+        ylabel="Continuity per 1,000 retrieval tokens",
+        caption=("CES_retrieval = continuity ÷ retrieval tokens. Measures memory "
+                 "policy efficiency, not full-prompt efficiency."))
+
+
+def ces_total_chart(agg, out):
+    return _single_metric_chart(
+        agg, out, key="ces_total", filename="ces_total.png",
+        title="CES_total — efficiency vs. total injected context",
+        ylabel="Continuity per 1,000 total context tokens",
+        caption=("CES_total = continuity ÷ total context tokens (system + "
+                 "memory + query). Charges TACO for its state briefing."))
+
+
+def ces_chart(agg, out):
+    """Back-compat: legacy `ces.png` retained as an alias for `ces_retrieval.png`.
+
+    Returns the alias path so callers that list outputs see both filenames.
+    """
+    p = ces_retrieval_chart(agg, out)
+    alias = out / "ces.png"
+    try:
+        alias.write_bytes(p.read_bytes())
+        return alias
+    except Exception:
+        return p
+
+
+def token_breakdown_chart(agg, out):
+    """Grouped bars per system showing where the tokens go:
+    retrieval / state-briefing / (system + query)."""
+    groups = ["Retrieval payload", "State briefing",
+              "System prompt + user query"]
+
+    def _stack(c):
+        t = agg["tokens"][c]
+        return [t["retrieval_tokens"], t["state_briefing_tokens"],
+                t["system_prompt_tokens"] + t["user_query_tokens"]]
+
+    series = {c: _stack(c) for c in ("rag", "taco")}
+    ymax = max(series["rag"] + series["taco"]) or 1.0
+    fig, ax = plt.subplots(figsize=(9, 5.4))
+    _grouped(ax, groups, series, ymax, "Tokens per turn")
+    ax.set_title("Token breakdown per turn")
+    ax.text(0.5, -0.17,
+            "TACO trades a smaller, bounded retrieval payload for a larger structured "
+            "state briefing; the eval reports CES against both retrieval and total context.",
             transform=ax.transAxes, ha="center", fontsize=8.5, color="#444444")
-    p = out / "ces.png"; fig.savefig(p); plt.close(fig); return p
+    p = out / "token_breakdown.png"; fig.savefig(p); plt.close(fig); return p
+
+
+def retrieval_vs_total_efficiency_chart(agg, out):
+    """Two grouped bars per system: CES_retrieval and CES_total side by side."""
+    groups = ["CES_retrieval", "CES_total"]
+
+    def _stack(c):
+        return [agg["ces_retrieval"][c] or 0.0, agg["ces_total"][c] or 0.0]
+
+    series = {c: _stack(c) for c in ("rag", "taco")}
+    ymax = max(series["rag"] + series["taco"]) or 1.0
+    fig, ax = plt.subplots(figsize=(8, 5.4))
+    _grouped(ax, groups, series, ymax,
+             "Continuity per 1,000 tokens (higher = better)")
+    ax.set_title("Retrieval efficiency vs. total-context efficiency")
+    ax.text(0.5, -0.17,
+            "CES_retrieval charges only memory retrieval. CES_total charges the full "
+            "injected context. TACO can lead on one without leading on the other.",
+            transform=ax.transAxes, ha="center", fontsize=8.5, color="#444444")
+    p = out / "retrieval_vs_total_efficiency.png"
+    fig.savefig(p); plt.close(fig); return p
 
 
 def scale_chart(agg, out):
@@ -164,6 +242,10 @@ def make_all(agg: Dict, out_dir: str) -> List[str]:
         dimensions_chart(agg, out),
         salience_chart(agg, out),
         tokens_chart(agg, out),
-        ces_chart(agg, out),
+        ces_chart(agg, out),               # back-compat: ces.png
+        ces_retrieval_chart(agg, out),     # new
+        ces_total_chart(agg, out),         # new
+        token_breakdown_chart(agg, out),   # new
+        retrieval_vs_total_efficiency_chart(agg, out),  # new
         scale_chart(agg, out),
     )]
