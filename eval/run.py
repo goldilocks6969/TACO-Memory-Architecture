@@ -68,7 +68,8 @@ def _write_report(agg: Dict, rows: List[Dict]) -> Path:
     L.append("")
     L.append(f"*Base model: `{agg['meta'].get('model','?')}` (identical in both "
              f"conditions) · {agg['n_probes']} probes · 8 multi-session personas "
-             f"· state_briefing_mode=`{agg['meta'].get('state_briefing_mode','?')}`.*")
+             f"· state_briefing_mode=`{agg['meta'].get('state_briefing_mode','?')}` "
+             f"· extraction_mode=`{agg['meta'].get('extraction_mode','?')}`.*")
     L.append("")
     L.append("## Summary")
     L.append("")
@@ -125,6 +126,27 @@ def _write_report(agg: Dict, rows: List[Dict]) -> Path:
         L.append("> **Honest comparison checks:**")
         for w in agg["warnings"]:
             L.append(f"> - {w}")
+        L.append("")
+
+    # write-path extraction summary
+    es = agg["meta"].get("extraction_stats") or {}
+    if es:
+        attempts = es.get("full_extract_attempts", 0)
+        successes = es.get("full_extract_successes", 0)
+        rate = es.get("rich_extraction_success_rate")
+        L.append("## Write-path extraction")
+        L.append("")
+        L.append(f"Extraction mode: `{agg['meta'].get('extraction_mode','?')}`")
+        L.append("")
+        L.append("| Counter | Value |")
+        L.append("|---|---:|")
+        L.append(f"| Light facts created | {es.get('light_facts_created', 0)} |")
+        L.append(f"| full_extract attempts | {attempts} |")
+        L.append(f"| full_extract successes | {successes} |")
+        L.append(f"| full_extract timeouts | {es.get('full_extract_timeouts', 0)} |")
+        L.append(f"| full_extract fallbacks | {es.get('full_extract_fallbacks', 0)} |")
+        L.append(f"| rich_extraction_success_rate | "
+                 f"{'n/a' if rate is None else f'{rate*100:.1f}%'} |")
         L.append("")
 
     # dimensions
@@ -285,6 +307,15 @@ def main() -> None:
     print(f"total tok/turn     : RAG {agg['total_tokens']['rag']:.0f}  "
           f"Taco {agg['total_tokens']['taco']:.0f}")
     print(f"compression ratio  : {agg['compression']['ratio']}")
+    es = agg["meta"].get("extraction_stats") or {}
+    rate = es.get("rich_extraction_success_rate")
+    print(f"extraction         : mode={agg['meta'].get('extraction_mode','?')} "
+          f"light_facts={es.get('light_facts_created', 0)} "
+          f"attempts={es.get('full_extract_attempts', 0)} "
+          f"successes={es.get('full_extract_successes', 0)} "
+          f"timeouts={es.get('full_extract_timeouts', 0)} "
+          f"fallbacks={es.get('full_extract_fallbacks', 0)} "
+          f"rich_success_rate={'n/a' if rate is None else f'{rate*100:.1f}%'}")
     for w in agg.get("warnings", []):
         print(f"WARNING: {w}")
     print(f"summary.csv: {summary_csv}")

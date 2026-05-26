@@ -72,6 +72,34 @@ STATE_BRIEFING_MINIMAL_MAX_TOKENS = int(
 
 
 # --------------------------------------------------------------------------- #
+# Extraction mode — controls the write path's structured-fact creation.
+#
+#   light  — every above-threshold turn synthesizes a *light fact* directly
+#            from LightExtract + the raw user message (no LLM, no
+#            decide_action).  Cheap, fast, hang-free.  **The eval harness
+#            default for the first real benchmark run.**
+#   auto   — write the light fact first, then attempt the rich full_extract
+#            only when ``light.salience >= 8 and len(user_message) < 1200``.
+#            On timeout/error, keep the light fact and continue.
+#   full   — original behaviour: full_extract every salient turn through
+#            decide_action / apply.  Best fidelity, but a single hung
+#            full_extract can wedge an entire scenario ingest.
+# --------------------------------------------------------------------------- #
+_VALID_EXTRACTION_MODES = ("light", "auto", "full")
+EXTRACTION_MODE = os.getenv("TACO_EVAL_EXTRACTION_MODE", "full").strip().lower()
+if EXTRACTION_MODE not in _VALID_EXTRACTION_MODES:
+    raise RuntimeError(
+        f"TACO_EVAL_EXTRACTION_MODE={EXTRACTION_MODE!r} is invalid; "
+        f"expected one of {_VALID_EXTRACTION_MODES}"
+    )
+
+# Thresholds the ``auto`` mode uses to decide whether full_extract is worth
+# the spend (and the hang risk) for a given turn.
+AUTO_FULL_MIN_SALIENCE = float(os.getenv("TACO_AUTO_FULL_MIN_SALIENCE", "8"))
+AUTO_FULL_MAX_CHARS = int(os.getenv("TACO_AUTO_FULL_MAX_CHARS", "1200"))
+
+
+# --------------------------------------------------------------------------- #
 # Retrieval scoring R(m) — §4.2
 #   R(m) = w_sem·sem + w_sal·sal + w_emo·emo + w_rec·rec + w_decay·decay
 # --------------------------------------------------------------------------- #

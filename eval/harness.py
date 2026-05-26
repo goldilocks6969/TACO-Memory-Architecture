@@ -199,9 +199,16 @@ def run() -> Dict:
     if not os.getenv("TACO_STATE_BRIEFING_MODE"):
         config.STATE_BRIEFING_MODE = "compact"
 
+    # Eval defaults to the LIGHT extraction mode so a hung full_extract cannot
+    # wedge an entire scenario ingest.  ``TACO_EVAL_EXTRACTION_MODE`` (light |
+    # auto | full) overrides for product-fidelity or debug runs.
+    if not os.getenv("TACO_EVAL_EXTRACTION_MODE"):
+        config.EXTRACTION_MODE = "light"
+
     mode = "MOCK" if config.MOCK else "LIVE"
     _log(f"starting harness.run() · mode={mode} · model={config.LLM_MODEL} "
-         f"· state_briefing_mode={config.STATE_BRIEFING_MODE}")
+         f"· state_briefing_mode={config.STATE_BRIEFING_MODE} "
+         f"· extraction_mode={config.EXTRACTION_MODE}")
     _log(f"loading {len(SCENARIOS)} scenarios from eval.dataset")
     ntok = counter(config.LLM_MODEL)
 
@@ -218,6 +225,14 @@ def run() -> Dict:
 
     rows: List[Dict] = []
     scale: List[Dict] = []
+    extraction_totals: Dict[str, int] = {
+        "light_facts_created": 0,
+        "full_extract_attempts": 0,
+        "full_extract_successes": 0,
+        "full_extract_timeouts": 0,
+        "full_extract_failures": 0,
+        "full_extract_fallbacks": 0,
+    }
 
     for si, scenario in enumerate(SCENARIOS, 1):
         _log(f"=== scenario {si}/{len(SCENARIOS)}: {scenario.name} (start) ===")
@@ -298,12 +313,28 @@ def run() -> Dict:
                  f"taco={t_judge['score']} rag={r_judge['score']} "
                  f"(written to {PARTIAL_PATH.name})")
 
+        # Roll up this scenario's write-path counters into the run total.
+        for k in extraction_totals:
+            extraction_totals[k] += taco.extraction_stats.get(k, 0)
         _log(f"=== scenario {si}/{len(SCENARIOS)}: {scenario.name} (done, "
              f"{len(scenario.probes)} probes scored) ===")
 
     conn.close()
-    _log("harness.run() complete — closing DB connection")
+    attempts = extraction_totals["full_extract_attempts"]
+    successes = extraction_totals["full_extract_successes"]
+    rich_rate = round(successes / attempts, 3) if attempts else None
+    _log(f"harness.run() complete · extraction={config.EXTRACTION_MODE} · "
+         f"light_facts={extraction_totals['light_facts_created']} · "
+         f"full_extract attempts/successes/timeouts/fallbacks="
+         f"{attempts}/{successes}/{extraction_totals['full_extract_timeouts']}/"
+         f"{extraction_totals['full_extract_fallbacks']}")
+    _log("closing DB connection")
     return {"rows": rows, "scale": scale,
             "meta": {"model": config.LLM_MODEL, "rag_topk": RAG_TOPK,
                      "taco_topk": config.TOP_K, "mode": mode,
-                     "state_briefing_mode": config.STATE_BRIEFING_MODE}}
+                     "state_briefing_mode": config.STATE_BRIEFING_MODE,
+                     "extraction_mode": config.EXTRACTION_MODE,
+                     "extraction_stats": {
+                         **extraction_totals,
+                         "rich_extraction_success_rate": rich_rate,
+                     }}}

@@ -156,6 +156,62 @@ def _heuristic_full(text: str, light: LightExtract) -> FullExtract:
 
 
 # --------------------------------------------------------------------------- #
+# Light-fact synthesis — the cheap, hang-free fact builder used by the LIGHT
+# extraction mode (and by AUTO as a baseline before the LLM upgrade attempt).
+# No LLM call: only the LightExtract output plus the deterministic
+# event/thread heuristics already used by the keyless fallback.
+# --------------------------------------------------------------------------- #
+_LIGHT_SUMMARY_MAX_CHARS = 240
+
+
+def _condense(text: str, max_chars: int = _LIGHT_SUMMARY_MAX_CHARS) -> str:
+    """Trim ``text`` to ``max_chars`` graphemes, on a word boundary, with an
+    ellipsis when truncated."""
+    s = " ".join(text.strip().split())
+    if len(s) <= max_chars:
+        return s
+    cut = s[: max_chars - 1].rstrip()
+    sp = cut.rfind(" ")
+    if sp > max_chars - 40:  # don't lose too much to alignment
+        cut = cut[:sp].rstrip()
+    return cut + "…"
+
+
+def light_fact(text: str, light: LightExtract,
+               max_chars: int = _LIGHT_SUMMARY_MAX_CHARS) -> Fact:
+    """Build one usable structured Fact directly from ``light`` and the raw
+    message, with no LLM round-trip.
+
+    Used by the LIGHT extraction mode as the canonical fact, and by AUTO as
+    the always-stored baseline before any (optional) full_extract upgrade
+    attempt.  Carries the schema fields the eval harness needs (salience,
+    tone, retrieval_cues, entity_keys, thread_status) populated from the
+    cheap signals the light tier already produced.
+    """
+    is_thread = _is_thread(text)
+    # Prefer the LLM-suggested cues; fall back to the heuristic cue map so a
+    # message that didn't surface any cues still gets a useful one.
+    cues = list(dict.fromkeys(
+        list(light.retrieval_cues or []) + _heuristic_cues(text, limit=3)
+    ))[:3]
+    return Fact(
+        summary=_condense(text, max_chars=max_chars),
+        fact_type="thread" if is_thread else "event",
+        event_type="thread" if is_thread else _heuristic_event_type(text),
+        emotional_tone=light.tone,
+        emotional_cause=None,
+        user_belief=None,
+        salience=light.salience,
+        retrieval_cues=cues,
+        entity_keys=list(light.entities)[:6],
+        validity="current",
+        thread_status="unresolved" if is_thread else None,
+        due_date=None,
+        confidence=0.6,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # LLM tiers
 # --------------------------------------------------------------------------- #
 _LIGHT_SYS = (

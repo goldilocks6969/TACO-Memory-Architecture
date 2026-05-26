@@ -27,10 +27,24 @@ from . import config, embeddings, llm
 from .memory import (decay, extract, identity, operations, reconsolidation,
                      retrieval, salience, store)
 from .memory.episode import Episode
+from .retry import CallTimeout
 from .state import ContentSignal, LatentState, infer_state
 from .subsystems import orchestrator, prediction
 from .subsystems.orchestrator import CognitivePlan
 from .subsystems.prediction import PredictiveContinuity
+
+
+def _new_extraction_stats() -> Dict[str, int]:
+    """A fresh per-Taco counter dict. ``extraction_mode`` is captured live by
+    the harness so callers can scrape an aggregate run summary."""
+    return {
+        "light_facts_created": 0,
+        "full_extract_attempts": 0,
+        "full_extract_successes": 0,
+        "full_extract_timeouts": 0,
+        "full_extract_failures": 0,
+        "full_extract_fallbacks": 0,
+    }
 
 
 @dataclass
@@ -66,6 +80,9 @@ class Taco:
                                         user_id=user_id):
             self.working.append(ep)
         self.state = store.last_state(conn, user_id=user_id) or LatentState()
+        # Per-instance write-path counters; the eval harness sums these across
+        # scenarios to populate the run-level extraction summary.
+        self.extraction_stats: Dict[str, int] = _new_extraction_stats()
 
     # ------------------------------------------------------------------ #
     def _hours_since_last(self) -> float:
@@ -180,10 +197,31 @@ class Taco:
                           briefing_sections=sections)
 
     # ------------------------------------------------------------------ #
-    def _write_facts(self, user_message: str, light: "extract.LightExtract",
-                     source_episode_id: Optional[int]) -> None:
-        """Full-extract a salient turn and reconcile each fact against neighbours."""
-        full = extract.full_extract(user_message, light)
+    # ------------------------------------------------------------------ #
+    # Fact extraction write path — three modes, picked live from
+    # ``config.EXTRACTION_MODE`` so the eval harness can switch without
+    # re-importing.
+    # ------------------------------------------------------------------ #
+    def _store_light_fact(self, user_message: str,
+                          light: "extract.LightExtract",
+                          source_episode_id: Optional[int]) -> int:
+        """Synthesize a light fact (no LLM) and insert it. Returns the new id."""
+        fact = extract.light_fact(user_message, light)
+        f_emb = embeddings.embed_list(fact.summary)
+        fid = store.add_fact(self.conn, fact, f_emb, source_episode_id,
+                             self.state, user_id=self.user_id)
+        self.extraction_stats["light_facts_created"] += 1
+        print("[extract] light fact created", flush=True)
+        return fid
+
+    def _apply_full_facts(self, full: "extract.FullExtract",
+                          source_episode_id: Optional[int]) -> None:
+        """Run the rich facts through dedup (``decide_action``) + ``apply``.
+
+        Used by the FULL mode and by AUTO mode's post-light upgrade step.
+        A fact whose summary is close to the light fact merges into it
+        (``operations.apply`` MERGE branch); a distinct fact ADDs alongside.
+        """
         for fact in full.facts:
             f_emb = embeddings.embed_list(fact.summary)
             neighbors = store.fact_neighbors(self.conn, f_emb, k=3, min_sim=0.7,
@@ -192,6 +230,66 @@ class Taco:
             operations.apply(self.conn, action, fact, f_emb,
                              source_episode_id, self.state,
                              user_id=self.user_id)
+
+    def _write_facts(self, user_message: str, light: "extract.LightExtract",
+                     source_episode_id: Optional[int]) -> None:
+        """Persist the structured fact(s) for one above-threshold turn.
+
+        The caller (``turn``) has already enforced the salience gate
+        (``light.salience >= self.state.theta_facts()``), so trivial turns
+        never reach this method — that satisfies "do not store trivial
+        turns as facts" without a duplicate check here.
+        """
+        mode = config.EXTRACTION_MODE
+
+        if mode == "light":
+            # One light fact, period. No full_extract, no decide_action — the
+            # cheap, hang-free write path the first real benchmark uses.
+            self._store_light_fact(user_message, light, source_episode_id)
+            return
+
+        if mode == "auto":
+            # Light fact first so we never have *no* fact, even if the
+            # subsequent rich extraction times out.
+            self._store_light_fact(user_message, light, source_episode_id)
+            if (light.salience < config.AUTO_FULL_MIN_SALIENCE
+                    or len(user_message) >= config.AUTO_FULL_MAX_CHARS):
+                return  # not worth the rich-extract spend / hang risk
+            self.extraction_stats["full_extract_attempts"] += 1
+            try:
+                full = extract.full_extract(user_message, light)
+            except CallTimeout as e:
+                self.extraction_stats["full_extract_timeouts"] += 1
+                self.extraction_stats["full_extract_fallbacks"] += 1
+                print(f"[extract] full_extract TIMED OUT; keeping light "
+                      f"fact: {e}", flush=True)
+                return
+            except Exception as e:  # noqa: BLE001 — provider errors vary
+                self.extraction_stats["full_extract_failures"] += 1
+                self.extraction_stats["full_extract_fallbacks"] += 1
+                print(f"[extract] full_extract FAILED; keeping light fact: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                return
+            self.extraction_stats["full_extract_successes"] += 1
+            try:
+                self._apply_full_facts(full, source_episode_id)
+                print(f"[extract] full extraction produced {len(full.facts)} "
+                      "fact(s); light fact upgraded/merged", flush=True)
+            except CallTimeout as e:
+                # decide_action timed out — light fact still stands.
+                self.extraction_stats["full_extract_timeouts"] += 1
+                self.extraction_stats["full_extract_fallbacks"] += 1
+                print(f"[extract] decide_action TIMED OUT; keeping light "
+                      f"fact: {e}", flush=True)
+            return
+
+        # mode == "full" — original behaviour.  A hang here will raise
+        # CallTimeout and abort the current turn, which is the failure mode
+        # this whole option set exists to give the user a way out of.
+        full = extract.full_extract(user_message, light)
+        self.extraction_stats["full_extract_attempts"] += 1
+        self.extraction_stats["full_extract_successes"] += 1
+        self._apply_full_facts(full, source_episode_id)
 
     def _surface_threads(self, top: List[Episode]) -> List[Episode]:
         """Always include open threads due within 7 days, regardless of score."""
