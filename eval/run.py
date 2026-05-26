@@ -128,6 +128,29 @@ def _write_report(agg: Dict, rows: List[Dict]) -> Path:
             L.append(f"> - {w}")
         L.append("")
 
+    # retrieval-path summary (Phase 2 hybrid)
+    rs = agg["meta"].get("retrieval_stats") or {}
+    if rs:
+        L.append("## Retrieval (Phase 2 hybrid)")
+        L.append("")
+        L.append(f"Mode: `{agg['meta'].get('retrieval_mode','?')}` · "
+                 f"cross_encoder=`{int(agg['meta'].get('cross_encoder_enabled', False))}` · "
+                 f"strong_rerank=`{int(agg['meta'].get('strong_rerank_enabled', False))}`")
+        L.append("")
+        calls = rs.get("retrieval_calls", 0) or 1
+        L.append("| Retriever | Total candidates | Avg per call |")
+        L.append("|---|---:|---:|")
+        for label, key in (
+            ("Semantic kNN", "candidates_semantic"),
+            ("Summary trigram", "candidates_summary"),
+            ("Cue trigram", "candidates_cues"),
+            ("Entity overlap", "candidates_entity"),
+            ("After RRF", "candidates_after_rrf"),
+        ):
+            tot = rs.get(key, 0)
+            L.append(f"| {label} | {tot} | {tot/calls:.1f} |")
+        L.append("")
+
     # write-path extraction summary
     es = agg["meta"].get("extraction_stats") or {}
     if es:
@@ -307,6 +330,19 @@ def main() -> None:
     print(f"total tok/turn     : RAG {agg['total_tokens']['rag']:.0f}  "
           f"Taco {agg['total_tokens']['taco']:.0f}")
     print(f"compression ratio  : {agg['compression']['ratio']}")
+    print(f"probe timeouts     : {agg['meta'].get('timeouts', 0)} "
+          f"(by stage: {agg['meta'].get('timeouts_by_stage', {})})")
+    rs = agg["meta"].get("retrieval_stats") or {}
+    if rs:
+        calls = rs.get('retrieval_calls', 0) or 1
+        print(f"retrieval (hybrid) : mode={agg['meta'].get('retrieval_mode','?')} "
+              f"calls={rs.get('retrieval_calls', 0)} "
+              f"sem={rs.get('candidates_semantic', 0)}/"
+              f"sum={rs.get('candidates_summary', 0)}/"
+              f"cue={rs.get('candidates_cues', 0)}/"
+              f"ent={rs.get('candidates_entity', 0)} "
+              f"after_rrf={rs.get('candidates_after_rrf', 0)} "
+              f"(avg/call: {rs.get('candidates_after_rrf', 0) / calls:.1f})")
     es = agg["meta"].get("extraction_stats") or {}
     rate = es.get("rich_extraction_success_rate")
     print(f"extraction         : mode={agg['meta'].get('extraction_mode','?')} "

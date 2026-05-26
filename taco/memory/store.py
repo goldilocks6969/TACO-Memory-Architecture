@@ -254,6 +254,126 @@ def mark_fact_outdated(conn: psycopg.Connection, fact_id: int,
     )
 
 
+# --------------------------------------------------------------------------- #
+# Phase 2 retrievers — text, cue, and entity-overlap candidate searches that
+# complement the semantic kNN.  Each one catches the "extension/function
+# not available" failure mode and returns ``[]`` so a deployment without
+# pg_trgm doesn't crash the whole hybrid pipeline; the orchestrator logs the
+# fallback.
+# --------------------------------------------------------------------------- #
+def _safe_fact_text_query(conn: psycopg.Connection, sql: str, params: tuple,
+                          label: str) -> List[Episode]:
+    """Run a pg_trgm-backed query and degrade to ``[]`` on missing extension
+    / index — callers (hybrid orchestrator) check the resulting count and
+    log a warning when the empty list is the *result of a fallback*."""
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except psycopg.Error as e:
+        # Don't let pg_trgm being unavailable blow up the run; the hybrid
+        # orchestrator continues with the remaining retrievers.
+        import logging
+        logging.getLogger("taco.store").warning(
+            "%s failed (%s); falling back to no candidates", label, e
+        )
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return []
+    return [_fact_row_to_episode(r) for r in rows]
+
+
+def fact_text_search(conn: psycopg.Connection, query_text: str, k: int = 20,
+                     min_similarity: float = 0.05,
+                     user_id: str = DEFAULT_USER_ID) -> List[Episode]:
+    """pg_trgm similarity over ``facts.summary`` — surfaces facts whose
+    summary text overlaps the query (paraphrase / surface form match).
+
+    The result list is ordered by trigram similarity descending and capped
+    at *k*; rows below ``min_similarity`` are dropped to keep RRF clean.
+    The Episode adapter's ``similarity`` field carries the trigram score so
+    callers can inspect it.
+    """
+    if not (query_text or "").strip():
+        return []
+    sql = """
+        SELECT id, user_id, summary, salience, vitality, emotional_tone,
+               created_at, similarity(summary, %s) AS sim
+        FROM facts
+        WHERE user_id = %s AND validity = 'current'
+              AND summary %% %s
+              AND similarity(summary, %s) >= %s
+        ORDER BY similarity(summary, %s) DESC
+        LIMIT %s
+    """
+    return _safe_fact_text_query(
+        conn, sql,
+        (query_text, user_id, query_text, query_text, min_similarity,
+         query_text, k),
+        label="store.fact_text_search",
+    )
+
+
+def fact_cue_search(conn: psycopg.Connection, query_text: str, k: int = 20,
+                    min_similarity: float = 0.05,
+                    user_id: str = DEFAULT_USER_ID) -> List[Episode]:
+    """pg_trgm similarity over the denormalized ``facts.cues_text``.
+
+    Each fact's ``retrieval_cues`` are joined into ``cues_text`` at write
+    time (we can't index an array directly).  This retriever lets a probe
+    like "what's my dog's name?" surface a fact whose cues include
+    "dog name" / "pet name" even when the summary text doesn't say "dog".
+    """
+    if not (query_text or "").strip():
+        return []
+    sql = """
+        SELECT id, user_id, summary, salience, vitality, emotional_tone,
+               created_at, similarity(COALESCE(cues_text, ''), %s) AS sim
+        FROM facts
+        WHERE user_id = %s AND validity = 'current'
+              AND cues_text IS NOT NULL
+              AND cues_text %% %s
+              AND similarity(cues_text, %s) >= %s
+        ORDER BY similarity(cues_text, %s) DESC
+        LIMIT %s
+    """
+    return _safe_fact_text_query(
+        conn, sql,
+        (query_text, user_id, query_text, query_text, min_similarity,
+         query_text, k),
+        label="store.fact_cue_search",
+    )
+
+
+def fact_entity_overlap(conn: psycopg.Connection, entity_keys: List[str],
+                        k: int = 20,
+                        user_id: str = DEFAULT_USER_ID) -> List[Episode]:
+    """GIN array-overlap search over ``facts.entity_keys``.
+
+    Returns facts that share at least one ``type:value`` key with the query.
+    Ordered by overlap count desc, then salience.  Empty input → empty
+    result (no entities means no entity-overlap retrieval to do).
+    """
+    keys = [k for k in (entity_keys or []) if k]
+    if not keys:
+        return []
+    sql = """
+        SELECT id, user_id, summary, salience, vitality, emotional_tone,
+               created_at,
+               cardinality(ARRAY(SELECT unnest(entity_keys)
+                                 INTERSECT SELECT unnest(%s::text[]))) AS overlap
+        FROM facts
+        WHERE user_id = %s AND validity = 'current'
+              AND entity_keys && %s::text[]
+        ORDER BY overlap DESC, salience DESC
+        LIMIT %s
+    """
+    return _safe_fact_text_query(
+        conn, sql, (keys, user_id, keys, k),
+        label="store.fact_entity_overlap",
+    )
+
+
 def due_threads(conn: psycopg.Connection, within_days: int = 7,
                 user_id: str = DEFAULT_USER_ID) -> List[Episode]:
     """Open threads (L-thread) whose due_date lands within the window — always

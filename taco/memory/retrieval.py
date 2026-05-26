@@ -9,11 +9,13 @@ R(m), selects the top 4, and assembles them into a single narrative briefing.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from .episode import Episode
 from .. import config
 from ..state import LatentState
+from . import rerank as _rerank
+from . import store as _store
 
 if TYPE_CHECKING:  # avoids a runtime memory→subsystems import; duck-typed below
     from ..subsystems.reasoning import ReasoningStance
@@ -319,3 +321,96 @@ def assemble_briefing(memories: List[Episode], beliefs: List[str],
     """
     return _join_sections(briefing_sections(
         memories, beliefs, working, state, stance, identity, prediction))
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 — hybrid retrieval orchestrator
+#
+# This is the "stop relying on cosine alone" path.  Four candidate retrievers
+# fire in parallel; RRF fuses their rankings; an optional cross-encoder
+# reranks the top-30 survivors; the state-modulated R(m) tilt picks the
+# final top-k.  Every TACO invariant is preserved:
+#
+#   * write-time salience gate stays in front of all of this
+#     (low-salience turns never reach the facts table)
+#   * scenario isolation: every candidate query carries the caller's user_id
+#   * state weighting: the final tilt is the same R(m) the semantic path uses
+# --------------------------------------------------------------------------- #
+def _empty_stats() -> Dict[str, int]:
+    return {
+        "candidates_semantic": 0,
+        "candidates_summary": 0,
+        "candidates_cues": 0,
+        "candidates_entity": 0,
+        "candidates_after_rrf": 0,
+        "cross_encoder_enabled": 0,
+        "strong_rerank_enabled": 0,
+    }
+
+
+def hybrid_retrieve(conn, query_text: str, query_embedding: List[float],
+                    state: LatentState, *, user_id: str,
+                    top_k: Optional[int] = None,
+                    per_retriever_k: Optional[int] = None,
+                    after_rrf_k: Optional[int] = None,
+                    ) -> Tuple[List[Episode], Dict[str, int]]:
+    """Cast four candidate sources, RRF-fuse, optional cross-encoder rerank,
+    then apply the state-modulated tilt.
+
+    Returns ``(top_k_episodes, stats)`` where *stats* counts the candidates
+    each retriever produced and which rerank steps actually ran.  The harness
+    aggregates these per-run for the report.
+    """
+    top_k = top_k if top_k is not None else config.TOP_K
+    per_retriever_k = per_retriever_k if per_retriever_k is not None \
+        else config.HYBRID_PER_RETRIEVER_K
+    after_rrf_k = after_rrf_k if after_rrf_k is not None \
+        else config.HYBRID_AFTER_RRF_K
+
+    stats = _empty_stats()
+
+    # ----- (a) semantic kNN over fact embeddings ---------------------------
+    semantic = _store.fact_knn_candidates(conn, query_embedding,
+                                           per_retriever_k, user_id=user_id)
+    stats["candidates_semantic"] = len(semantic)
+
+    # ----- (b) summary trigram --------------------------------------------
+    summary_hits = _store.fact_text_search(conn, query_text, k=per_retriever_k,
+                                            user_id=user_id)
+    stats["candidates_summary"] = len(summary_hits)
+
+    # ----- (c) cue trigram, using both the raw query AND any generated cues
+    cues = _rerank.extract_query_cues(query_text)
+    cue_query = " ".join([query_text, *cues]).strip()
+    cue_hits = _store.fact_cue_search(conn, cue_query, k=per_retriever_k,
+                                       user_id=user_id)
+    stats["candidates_cues"] = len(cue_hits)
+
+    # ----- (d) entity overlap ---------------------------------------------
+    entities = _rerank.extract_query_entities(query_text)
+    entity_hits = (_store.fact_entity_overlap(conn, entities, k=per_retriever_k,
+                                               user_id=user_id)
+                   if entities else [])
+    stats["candidates_entity"] = len(entity_hits)
+
+    # ----- RRF fusion -----------------------------------------------------
+    # Order matters: semantic first so the cosine ``similarity`` field
+    # survives dedup (we use it in the final R(m) tilt).
+    fused = _rerank.rrf_fuse([semantic, summary_hits, cue_hits, entity_hits],
+                              k=config.HYBRID_RRF_K)[:after_rrf_k]
+    stats["candidates_after_rrf"] = len(fused)
+
+    # ----- Optional cross-encoder rerank ----------------------------------
+    if config.CROSS_ENCODER_RERANK:
+        fused = _rerank.cross_encoder_rerank(query_text, fused)[:after_rrf_k]
+        stats["cross_encoder_enabled"] = 1
+
+    # ----- Optional strong-LLM rerank (ablation) --------------------------
+    if config.STRONG_RERANK:
+        fused = _rerank.strong_llm_rerank(query_text, fused)[:after_rrf_k]
+        stats["strong_rerank_enabled"] = 1
+
+    # ----- Final state-modulated R(m) tilt + isolation assert -------------
+    final = rerank(fused, state, top_k=top_k)
+    _rerank.assert_user_isolation(final, user_id)
+    return final, stats

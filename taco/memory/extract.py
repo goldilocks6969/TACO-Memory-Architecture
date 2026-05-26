@@ -248,8 +248,36 @@ _FULL_SYS = (
 )
 
 
+# One-shot announce flag so the eval log doesn't print the "local light_extract"
+# notice on every turn — once per process is enough to confirm the path.
+_LIGHT_LOCAL_ANNOUNCED = False
+
+
+def _maybe_announce_local() -> None:
+    global _LIGHT_LOCAL_ANNOUNCED
+    if not _LIGHT_LOCAL_ANNOUNCED:
+        print("[extract] local light_extract used "
+              "(TACO_EVAL_LIGHT_EXTRACT_LOCAL=1)", flush=True)
+        _LIGHT_LOCAL_ANNOUNCED = True
+
+
 def light_extract(text: str) -> LightExtract:
-    """Cheap per-turn extraction. Heuristic under TACO_MOCK=1, else one LLM call."""
+    """Cheap per-turn extraction.
+
+    Three paths, in priority order:
+
+    * ``config.LIGHT_EXTRACT_LOCAL`` (eval default) — always use the keyless
+      heuristic, even when an API key is configured.  The live benchmark
+      depends on this: the LLM-backed light tier can wedge during long
+      scenario ingests, and the heuristic carries every field the downstream
+      ``light_fact`` builder needs (salience, tone, vulnerability,
+      retrieval_cues, entities).
+    * ``llm.available()`` false (TACO_MOCK=1 / no key) — heuristic, as before.
+    * Otherwise — one cheap LLM JSON call, bounded by ``CallTimeout``.
+    """
+    if config.LIGHT_EXTRACT_LOCAL:
+        _maybe_announce_local()
+        return _heuristic_light(text)
     if not llm.available():
         return _heuristic_light(text)
     resp = with_retries(lambda: llm._client().chat.completions.create(

@@ -100,6 +100,152 @@ AUTO_FULL_MAX_CHARS = int(os.getenv("TACO_AUTO_FULL_MAX_CHARS", "1200"))
 
 
 # --------------------------------------------------------------------------- #
+# Ingest-only mode — used by the eval harness to skip the expensive
+# ``llm.respond`` call during scenario ingest.  The probe phase still calls
+# respond normally; this only affects ``Taco.turn`` invocations during the
+# pre-probe history replay.
+#
+# Read live (``config.SKIP_RESPOND_DURING_INGEST``) so the eval harness can
+# flip it without re-importing.  CLI / product behaviour is unaffected — the
+# Taco.turn ``generate_response`` kwarg defaults to True.
+# --------------------------------------------------------------------------- #
+SKIP_RESPOND_DURING_INGEST = (
+    os.getenv("TACO_EVAL_SKIP_RESPOND_DURING_INGEST", "0").strip() == "1"
+)
+
+
+# --------------------------------------------------------------------------- #
+# Local light-extract — force the keyless heuristic path inside
+# ``extract.light_extract`` even when an API key is configured.  This is what
+# makes LIGHT extraction mode genuinely hang-free for the live benchmark
+# (the LLM-backed light tier can wedge in the same way ``respond`` can).
+#
+# Read live (``config.LIGHT_EXTRACT_LOCAL``) so the eval harness can flip it
+# without re-importing.  Product / CLI behaviour is unaffected: this defaults
+# to ``False`` outside the eval harness, so the LLM-backed light tier is
+# still available for richer per-turn extraction.
+# --------------------------------------------------------------------------- #
+LIGHT_EXTRACT_LOCAL = (
+    os.getenv("TACO_EVAL_LIGHT_EXTRACT_LOCAL", "0").strip() == "1"
+)
+
+
+# --------------------------------------------------------------------------- #
+# Response + judge controls
+#
+# The benchmark needs the model that *answers probes* and the model that
+# *judges those answers* to be bounded and replaceable independently of the
+# cognitive-layer LLM.  In practice the response model may be a faster /
+# cheaper tier than the model we use for extraction; the judge is its own
+# choice altogether.  Both default to ``LLM_MODEL`` so single-model setups
+# don't need to set anything new.
+# --------------------------------------------------------------------------- #
+RESPONSE_MODEL = os.getenv("TACO_RESPONSE_MODEL", "") or LLM_MODEL
+JUDGE_MODEL = os.getenv("TACO_JUDGE_MODEL", "") or LLM_MODEL
+
+# Hard output-token caps — keep both answers and judge replies short so a
+# single runaway generation cannot wedge the benchmark.  Defaults tuned for
+# the live benchmark; product callers can raise them via env if needed.
+RESPONSE_MAX_TOKENS = int(os.getenv("TACO_RESPONSE_MAX_TOKENS", "120"))
+JUDGE_MAX_TOKENS = int(os.getenv("TACO_JUDGE_MAX_TOKENS", "80"))
+
+# Per-request SDK timeout passed directly to the OpenAI client (separate from
+# the outer ``with_retries`` thread timeout).  Setting this below the thread
+# timeout means the SDK aborts first, surfacing a clean openai exception
+# rather than a thread-level CallTimeout when the server is slow.
+LLM_REQUEST_TIMEOUT_S = float(os.getenv("TACO_LLM_REQUEST_TIMEOUT_S", "30"))
+
+# Use a short "answer concisely from memory" prompt for benchmark response
+# generation instead of the verbose cognitive-layer briefing.  Read live so
+# the eval harness can flip it without re-importing; defaults off for the
+# CLI / product path so normal turns still get the full reasoning briefing.
+FAST_RESPONSES = (
+    os.getenv("TACO_EVAL_FAST_RESPONSES", "0").strip() == "1"
+)
+
+# Master "fast live benchmark" flag.  When set, the harness:
+#   * uses the spec-prescribed terse response prompt
+#     ("Answer the user using only the memory context. Be concise. If the
+#     answer is not in memory, say you do not know.")
+#   * forces ``temperature=0`` on the response call (no creative variance);
+#   * uses a shortened judge rubric (still returning the same JSON contract);
+#   * implies ``FAST_RESPONSES`` so the response system prompt collapses to
+#     the short directive and the cognitive briefing moves to the user role.
+# Read live so the harness can flip it without re-importing.
+FAST_LIVE = (
+    os.getenv("TACO_EVAL_FAST_LIVE", "0").strip() == "1"
+)
+
+
+def _opt_int(name: str):
+    """Return ``int(os.environ[name])`` or ``None`` when the env var is unset
+    or empty (helper for the limit knobs below)."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+# Smoke-mode limits for cheap live runs.  When set, the harness processes
+# only the first N scenarios and the first M probes per scenario.  Unset →
+# the full benchmark.  These are intentionally **not** capped by the eval
+# default because a real benchmark wants every scenario / probe; smoke runs
+# opt in explicitly.
+LIMIT_SCENARIOS = _opt_int("TACO_EVAL_LIMIT_SCENARIOS")
+LIMIT_PROBES = _opt_int("TACO_EVAL_LIMIT_PROBES")
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2: hybrid retrieval
+#
+#   semantic — original pgvector kNN over fact embeddings only.  Single
+#              candidate source; cosine similarity is the only signal.
+#   hybrid   — four candidate retrievers (semantic + summary-trigram +
+#              cue-trigram + entity-overlap) fused with RRF, optionally
+#              cross-encoder reranked, then state-modulated R(m) tilted.
+#              Designed to dramatically improve recall on paraphrased queries
+#              while preserving every TACO invariant (write-time salience,
+#              state weighting, scenario isolation, filler suppression).
+#
+# Read live so the harness can flip the mode without re-importing.  Product /
+# CLI default stays ``semantic`` for back-compat; the eval harness defaults
+# to ``hybrid``.
+# --------------------------------------------------------------------------- #
+_VALID_RETRIEVAL_MODES = ("semantic", "hybrid")
+RETRIEVAL_MODE = os.getenv("TACO_RETRIEVAL_MODE", "semantic").strip().lower()
+if RETRIEVAL_MODE not in _VALID_RETRIEVAL_MODES:
+    raise RuntimeError(
+        f"TACO_RETRIEVAL_MODE={RETRIEVAL_MODE!r} is invalid; "
+        f"expected one of {_VALID_RETRIEVAL_MODES}"
+    )
+
+# Optional cross-encoder rerank step between RRF fusion and the state-
+# modulated tilt.  Off by default — keeps the Phase 2 baseline dependency-
+# free.  When on, the implementation tries to load
+# ``BAAI/bge-reranker-v2-m3`` via fastembed; failure logs a warning and
+# falls back to RRF-only ordering.
+CROSS_ENCODER_RERANK = (
+    os.getenv("TACO_CROSS_ENCODER_RERANK", "0").strip() == "1"
+)
+
+# Optional secondary LLM "strong rerank" pass over the surviving candidates
+# (separate from the cross-encoder above).  Off by default and intentionally
+# *not* enabled during normal evaluation — it's an ablation knob.
+STRONG_RERANK = (
+    os.getenv("TACO_STRONG_RERANK", "0").strip() == "1"
+)
+
+# Per-retriever candidate cap and post-RRF candidate cap.  Tunable for
+# experiments without changing the algorithm.
+HYBRID_PER_RETRIEVER_K = int(os.getenv("TACO_HYBRID_PER_RETRIEVER_K", "20"))
+HYBRID_AFTER_RRF_K = int(os.getenv("TACO_HYBRID_AFTER_RRF_K", "30"))
+HYBRID_RRF_K = int(os.getenv("TACO_HYBRID_RRF_K", "60"))
+
+
+# --------------------------------------------------------------------------- #
 # Retrieval scoring R(m) — §4.2
 #   R(m) = w_sem·sem + w_sal·sal + w_emo·emo + w_rec·rec + w_decay·decay
 # --------------------------------------------------------------------------- #

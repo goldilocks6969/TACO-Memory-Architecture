@@ -83,6 +83,19 @@ class Taco:
         # Per-instance write-path counters; the eval harness sums these across
         # scenarios to populate the run-level extraction summary.
         self.extraction_stats: Dict[str, int] = _new_extraction_stats()
+        # Phase 2 hybrid retrieval — running totals across every turn/probe
+        # this Taco instance has handled.  The harness aggregates these
+        # per-scenario, then per-run, for the report.
+        self.retrieval_stats: Dict[str, int] = {
+            "retrieval_calls": 0,
+            "candidates_semantic": 0,
+            "candidates_summary": 0,
+            "candidates_cues": 0,
+            "candidates_entity": 0,
+            "candidates_after_rrf": 0,
+            "cross_encoder_calls": 0,
+            "strong_rerank_calls": 0,
+        }
 
     # ------------------------------------------------------------------ #
     def _hours_since_last(self) -> float:
@@ -93,7 +106,23 @@ class Taco:
         return max(0.0, (now - last).total_seconds() / 3600.0)
 
     def turn(self, user_message: str,
-             hours_since_last: Optional[float] = None) -> TurnResult:
+             hours_since_last: Optional[float] = None,
+             generate_response: bool = True) -> TurnResult:
+        """Process one user message: light extract, state inference, retrieval,
+        (optional) response, memory write-back.
+
+        ``generate_response`` is **True** in normal product use — the reasoning
+        engine is invoked once per turn and the assistant reply lands in the
+        L1 working memory.
+
+        Set it to **False** to skip the ``llm.respond`` call entirely (the eval
+        harness uses this during scenario ingest so a wedged provider socket
+        cannot abort a 50-turn replay).  State inference, retrieval, episode /
+        fact / identity writes, and state logging all still run.  The returned
+        ``TurnResult.response`` is the empty string and the assistant entry is
+        **not** appended to the working-memory deque (it would otherwise feed
+        a stub into the next ingest turn's briefing).
+        """
         # 1. interoception + light extraction: affect + entities + cues in one call
         light = extract.light_extract(user_message)
         analysis = {"emotional": light.emotional, "vulnerability": light.vulnerability,
@@ -132,17 +161,29 @@ class Taco:
             self.conn, top_epi, self.state, current_tone,
             llm.reconsolidate, embeddings.embed_list, user_id=self.user_id)
 
-        # 6b. fact retrieval (+ state-gated anticipatory prefetch) → re-rank → top-k.
-        fact_cands = store.fact_knn_candidates(
-            self.conn, q_emb, config.CANDIDATE_CAST, user_id=self.user_id)
-        if pred.prefetch_query and pred.prefetch_query != user_message:
-            seen = {c.id for c in fact_cands}
-            pf_emb = embeddings.embed_list(pred.prefetch_query)
-            for c in store.fact_knn_candidates(
-                    self.conn, pf_emb, config.PREFETCH_K, user_id=self.user_id):
-                if c.id not in seen:
-                    fact_cands.append(c)
-        top = retrieval.rerank(fact_cands, self.state, top_k=config.TOP_K)
+        # 6b. fact retrieval — semantic kNN, or full Phase-2 hybrid (semantic +
+        #     summary trigram + cue trigram + entity overlap → RRF → optional
+        #     cross-encoder → state-modulated R(m) tilt) depending on
+        #     ``config.RETRIEVAL_MODE``.  The anticipatory L9 prefetch only
+        #     fires in the semantic path (it's a separate cosine query); in
+        #     hybrid mode the cue retriever subsumes that role.
+        if config.RETRIEVAL_MODE == "hybrid":
+            top, hstats = retrieval.hybrid_retrieve(
+                self.conn, user_message, q_emb, self.state,
+                user_id=self.user_id)
+            self._account_retrieval(hstats)
+        else:
+            fact_cands = store.fact_knn_candidates(
+                self.conn, q_emb, config.CANDIDATE_CAST, user_id=self.user_id)
+            if pred.prefetch_query and pred.prefetch_query != user_message:
+                seen = {c.id for c in fact_cands}
+                pf_emb = embeddings.embed_list(pred.prefetch_query)
+                for c in store.fact_knn_candidates(
+                        self.conn, pf_emb, config.PREFETCH_K,
+                        user_id=self.user_id):
+                    if c.id not in seen:
+                        fact_cands.append(c)
+            top = retrieval.rerank(fact_cands, self.state, top_k=config.TOP_K)
         top = self._surface_threads(top)  # open threads always included (Phase 1.6)
 
         beliefs = store.belief_candidates(self.conn, q_emb, k=2,
@@ -155,8 +196,14 @@ class Taco:
             identity=identity_lines, prediction=pred)
         briefing = retrieval._join_sections(sections)
 
-        # 8. single reasoning-engine invocation
-        response = llm.respond(briefing, user_message, plan.planning_depth)
+        # 8. single reasoning-engine invocation.  Skipped in ingest-only mode:
+        #    the eval harness sets generate_response=False during scenario
+        #    replay so the response LLM call (the hot failure mode) cannot
+        #    wedge an entire benchmark.  The probe phase still uses respond.
+        if generate_response:
+            response = llm.respond(briefing, user_message, plan.planning_depth)
+        else:
+            response = ""
 
         # 9. write path. Episodes are gated by the emotional threshold θ(S); facts
         #    by the lower informational gate θ_facts(S), so paraphrasable content
@@ -180,12 +227,15 @@ class Taco:
         if light.salience >= self.state.theta_facts():
             self._write_facts(user_message, light, ep_id)
 
-        # 10. write-back: working memory + persisted state
+        # 10. write-back: working memory + persisted state.  The assistant
+        #     turn is only appended when we actually produced a response —
+        #     otherwise an empty stub would feed into the next briefing.
         self.working.append(Episode(content=user_message, role="user",
                                     tone=analysis.get("tone"),
                                     user_id=self.user_id))
-        self.working.append(Episode(content=response, role="assistant",
-                                    user_id=self.user_id))
+        if generate_response:
+            self.working.append(Episode(content=response, role="assistant",
+                                        user_id=self.user_id))
         store.log_state(self.conn, self.state, user_id=self.user_id)
 
         return TurnResult(response=response, state=self.state, plan=plan,
@@ -291,6 +341,20 @@ class Taco:
         self.extraction_stats["full_extract_successes"] += 1
         self._apply_full_facts(full, source_episode_id)
 
+    def _account_retrieval(self, hstats: Dict[str, int]) -> None:
+        """Fold one hybrid_retrieve call's per-retriever counts into the
+        running totals on this Taco instance."""
+        s = self.retrieval_stats
+        s["retrieval_calls"] += 1
+        for key in ("candidates_semantic", "candidates_summary",
+                    "candidates_cues", "candidates_entity",
+                    "candidates_after_rrf"):
+            s[key] += hstats.get(key, 0)
+        if hstats.get("cross_encoder_enabled"):
+            s["cross_encoder_calls"] += 1
+        if hstats.get("strong_rerank_enabled"):
+            s["strong_rerank_calls"] += 1
+
     def _surface_threads(self, top: List[Episode]) -> List[Episode]:
         """Always include open threads due within 7 days, regardless of score."""
         threads = store.due_threads(self.conn, within_days=7,
@@ -323,9 +387,17 @@ class Taco:
             history, store.recent_salient_episodes(self.conn, user_id=self.user_id))
 
         q_emb = embeddings.embed_list(user_message)
-        fact_cands = store.fact_knn_candidates(
-            self.conn, q_emb, config.CANDIDATE_CAST, user_id=self.user_id)
-        top = self._surface_threads(retrieval.rerank(fact_cands, state, top_k=config.TOP_K))
+        if config.RETRIEVAL_MODE == "hybrid":
+            top, hstats = retrieval.hybrid_retrieve(
+                self.conn, user_message, q_emb, state,
+                user_id=self.user_id)
+            self._account_retrieval(hstats)
+            top = self._surface_threads(top)
+        else:
+            fact_cands = store.fact_knn_candidates(
+                self.conn, q_emb, config.CANDIDATE_CAST, user_id=self.user_id)
+            top = self._surface_threads(retrieval.rerank(
+                fact_cands, state, top_k=config.TOP_K))
         beliefs = store.belief_candidates(self.conn, q_emb, k=2,
                                           user_id=self.user_id)
         identity_lines = identity.snapshot_lines(self.conn, user_id=self.user_id)

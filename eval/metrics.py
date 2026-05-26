@@ -57,7 +57,11 @@ _TOKEN_FIELDS = (
 
 
 def _rows(rows, condition, kind=None):
-    out = [r for r in rows if r["condition"] == condition]
+    # Skip error rows (probes where an LLM stage timed out): they carry no
+    # score / token breakdown and would drag every mean towards zero.  The
+    # error rows are still preserved in results_partial.jsonl and counted in
+    # ``meta.timeouts`` for honest accounting.
+    out = [r for r in rows if r["condition"] == condition and not r.get("error")]
     if kind:
         out = [r for r in out if r["kind"] == kind]
     return out
@@ -191,13 +195,16 @@ def aggregate(result: Dict) -> Dict:
         out["warnings"].append(msg)
         print(f"[metrics] {msg}", file=sys.stderr)
 
-    # enrich each scenario with its per-condition avg retrieval payload (scale plot)
+    # enrich each scenario with its per-condition avg retrieval payload (scale
+    # plot). Error rows are excluded so a timeout doesn't pull the curve to 0.
     for s in scale:
         sc = s["scenario"]
         for c in CONDITIONS:
-            rs = [r for r in rows if r["scenario"] == sc and r["condition"] == c]
-            s[f"{c}_retr_tokens"] = round(mean(r["retrieval_tokens"] for r in rs), 1) \
-                if rs else 0.0
+            rs = [r for r in rows
+                  if r["scenario"] == sc and r["condition"] == c
+                  and not r.get("error")]
+            s[f"{c}_retr_tokens"] = round(
+                mean(r["retrieval_tokens"] for r in rs), 1) if rs else 0.0
 
     # corpus compression (Taco vs baseline), averaged across scenarios
     ratios = [s["taco_corpus_tokens"] / s["rag_corpus_tokens"]

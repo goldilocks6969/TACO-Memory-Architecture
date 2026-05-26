@@ -43,16 +43,31 @@ _RUBRIC = (
     '{"score": <0-100>, "reason": "<short>"}'
 )
 
+# Shorter rubric for FAST_LIVE benchmark runs.  Same JSON contract so all the
+# downstream parsing stays unchanged; fewer tokens in the system prompt and a
+# blunter scoring scale to keep the judge's reasoning brief.
+_RUBRIC_FAST = (
+    "Score 0-100 how well RESPONSE recalls/uses GROUND TRUTH for PROBE. "
+    "100=accurate, 50=partial, 0=missing/contradicts. Judge memory only, "
+    "not style. Reply JSON: {\"score\":0-100,\"reason\":\"short\"}"
+)
+
 
 def judge(probe_text: str, ground_truth: str, kind: str, response: str) -> Dict:
     """Score a response. Always returns ``input_text`` / ``output_text`` (the raw
     prompt and the raw judge reply) so the eval harness can charge judge tokens.
+
+    The system rubric collapses to ``_RUBRIC_FAST`` when ``config.FAST_LIVE``
+    is set — same JSON contract, fewer prompt tokens, and an explicit "short
+    reason" instruction.  ``config.JUDGE_MODEL``, ``config.JUDGE_MAX_TOKENS``,
+    and ``config.LLM_REQUEST_TIMEOUT_S`` all flow through to the SDK call.
     """
+    rubric = _RUBRIC_FAST if config.FAST_LIVE else _RUBRIC
     user = (
         f"PROBE: {probe_text}\nGROUND TRUTH: {ground_truth}\n"
         f"PROBE KIND: {kind}\nRESPONSE: {response}"
     )
-    input_text = _RUBRIC + "\n" + user
+    input_text = rubric + "\n" + user
 
     if config.MOCK:
         score = _mock_score(response, ground_truth)
@@ -70,11 +85,13 @@ def judge(probe_text: str, ground_truth: str, kind: str, response: str) -> Dict:
     raw_output = ""
     try:
         resp = with_retries(lambda: _client().chat.completions.create(
-            model=config.LLM_MODEL,
-            messages=[{"role": "system", "content": _RUBRIC},
+            model=config.JUDGE_MODEL,
+            messages=[{"role": "system", "content": rubric},
                       {"role": "user", "content": user}],
             temperature=0,
             response_format={"type": "json_object"},
+            max_tokens=config.JUDGE_MAX_TOKENS,
+            timeout=config.LLM_REQUEST_TIMEOUT_S,
         ), label=f"judge[{kind}]")
         raw_output = resp.choices[0].message.content
         data = json.loads(raw_output)

@@ -155,16 +155,57 @@ def analyze(text: str) -> Dict:
     }
 
 
+_FAST_RESPONSE_SYS = (
+    "Answer the user using only the memory context. Be concise. "
+    "If the answer is not in memory, say you do not know."
+)
+
+
 def respond(system_brief: str, user_message: str, planning_depth: int) -> str:
-    """The single reasoning-engine invocation (Figure 4 step 5)."""
+    """The single reasoning-engine invocation (Figure 4 step 5).
+
+    Hardened for the live benchmark:
+
+    * Uses ``config.RESPONSE_MODEL`` (separate from the extraction model).
+    * Caps the answer at ``config.RESPONSE_MAX_TOKENS`` so a runaway
+      generation cannot wedge the harness.
+    * Passes ``timeout=config.LLM_REQUEST_TIMEOUT_S`` to the SDK so the
+      provider aborts cleanly before the outer ``with_retries`` thread
+      timeout kicks in.
+    * When ``config.FAST_RESPONSES`` (implied by ``FAST_LIVE``) is set,
+      replaces the verbose cognitive briefing in the **system** role with the
+      spec-prescribed terse instruction and folds the briefing into the
+      **user** role as raw memory context.  The retrieval payload still
+      reaches the model; only the long reasoning / planning scaffolding is
+      dropped.
+    * Under ``FAST_LIVE`` the call is also forced to ``temperature=0`` so
+      the benchmark is deterministic across re-runs.
+    """
     if config.MOCK or not config.OPENAI_API_KEY:
         return _mock_respond(system_brief, user_message, planning_depth)
 
+    # FAST_LIVE implies FAST_RESPONSES — both collapse the system prompt.
+    fast_mode = config.FAST_RESPONSES or config.FAST_LIVE
+    if fast_mode:
+        system_content = _FAST_RESPONSE_SYS
+        user_content = (
+            f"Memory context:\n{system_brief}\n\n---\n\nUser: {user_message}"
+        )
+    else:
+        system_content = system_brief
+        user_content = user_message
+
+    # Deterministic in benchmark mode (FAST_LIVE).  Outside the benchmark we
+    # keep the existing 0.7 sampling so the product CLI still feels natural.
+    temperature = 0.0 if config.FAST_LIVE else 0.7
+
     resp = with_retries(lambda: _client().chat.completions.create(
-        model=config.LLM_MODEL,
-        messages=[{"role": "system", "content": system_brief},
-                  {"role": "user", "content": user_message}],
-        temperature=0.7,
+        model=config.RESPONSE_MODEL,
+        messages=[{"role": "system", "content": system_content},
+                  {"role": "user", "content": user_content}],
+        temperature=temperature,
+        max_tokens=config.RESPONSE_MAX_TOKENS,
+        timeout=config.LLM_REQUEST_TIMEOUT_S,
     ), label="llm.respond")
     return resp.choices[0].message.content.strip()
 
