@@ -12,6 +12,7 @@ class Episode:
 
     content: str
     role: str = "user"
+    user_id: str = "default"   # per-user namespace; set by store on read-back
     salience: float = 1.0
     tier_low: int = 1
     tier_high: int = 2

@@ -48,7 +48,7 @@ def embed(text: str) -> tuple:
             client = OpenAI(api_key=config.EMBED_API_KEY, base_url=config.EMBED_BASE_URL)
         return client.embeddings.create(model=config.EMBED_MODEL, input=text)
 
-    resp = with_retries(_call, attempts=8)
+    resp = with_retries(_call, attempts=8, label="embeddings.embed")
     return tuple(resp.data[0].embedding)
 
 

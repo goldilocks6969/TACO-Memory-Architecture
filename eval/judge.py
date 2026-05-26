@@ -75,7 +75,7 @@ def judge(probe_text: str, ground_truth: str, kind: str, response: str) -> Dict:
                       {"role": "user", "content": user}],
             temperature=0,
             response_format={"type": "json_object"},
-        ))
+        ), label=f"judge[{kind}]")
         raw_output = resp.choices[0].message.content
         data = json.loads(raw_output)
         score = int(max(0, min(100, float(data.get("score", 0)))))

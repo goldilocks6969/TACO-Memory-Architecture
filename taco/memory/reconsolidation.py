@@ -63,6 +63,7 @@ def reconsolidate(conn: psycopg.Connection, retrieved: List[Episode],
                   current_state: LatentState, current_tone: str,
                   reconsolidate_fn: Callable[[str, str, str], str],
                   embed_fn: Callable[[str], List[float]],
+                  user_id: str = store.DEFAULT_USER_ID,
                   ) -> ReconsolidationReport:
     """Evolve eligible retrieved memories. Bounded to RECON_MAX_PER_TURN rewrites."""
     report = ReconsolidationReport()
@@ -77,11 +78,12 @@ def reconsolidate(conn: psycopg.Connection, retrieved: List[Episode],
         # L3: rewrite the abstraction toward the integrated meaning.
         store.upsert_belief_evolution(
             conn, emb, belief, current_tone,
-            confidence=min(1.0, 0.6 + 0.1 * (current_state.K / 100.0)))
+            confidence=min(1.0, 0.6 + 0.1 * (current_state.K / 100.0)),
+            user_id=user_id)
         # L4: attenuate the emotional charge; mutate the trace (tone + timestamp).
         store.record_reconsolidation(
             conn, ep.id, new_tone=current_tone,
             new_intensity=attenuated_intensity(ep.s_e or current_state.E),
-            salience=ep.salience)
+            salience=ep.salience, user_id=user_id)
         report.rewrites.append((ep.id, belief))
     return report

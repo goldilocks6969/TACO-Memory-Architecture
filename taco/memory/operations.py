@@ -88,7 +88,7 @@ def decide_action(new_fact: Fact, neighbors: List[Fact]) -> Action:
                       {"role": "user", "content": user}],
             temperature=0,
             response_format={"type": "json_object"},
-        ))
+        ), label="operations.decide_action")
         d = json.loads(resp.choices[0].message.content)
     except Exception:
         return _heuristic_action(new_fact, neighbors)
@@ -109,7 +109,8 @@ def decide_action(new_fact: Fact, neighbors: List[Fact]) -> Action:
 
 def apply(conn: psycopg.Connection, action: Action, fact: Fact,
           embedding: List[float], source_episode_id: Optional[int],
-          state: Optional[LatentState] = None) -> Optional[int]:
+          state: Optional[LatentState] = None,
+          user_id: str = store.DEFAULT_USER_ID) -> Optional[int]:
     """Execute `action`. Returns the id of the resulting current fact (or None)."""
     if action.kind == NOOP:
         return action.target_id
@@ -117,19 +118,22 @@ def apply(conn: psycopg.Connection, action: Action, fact: Fact,
     if action.kind == MERGE and action.target_id is not None:
         store.merge_fact(conn, action.target_id,
                          action.content or fact.summary, embedding,
-                         source_episode_id, fact.retrieval_cues)
+                         source_episode_id, fact.retrieval_cues,
+                         user_id=user_id)
         return action.target_id
 
     if action.kind == DELETE and action.target_id is not None:
-        store.mark_fact_outdated(conn, action.target_id)
+        store.mark_fact_outdated(conn, action.target_id, user_id=user_id)
         return None
 
     if action.kind == UPDATE and action.target_id is not None:
         if action.content:
             fact.summary = action.content
-        new_id = store.add_fact(conn, fact, embedding, source_episode_id, state)
-        store.supersede_fact(conn, action.target_id, new_id)
+        new_id = store.add_fact(conn, fact, embedding, source_episode_id,
+                                state, user_id=user_id)
+        store.supersede_fact(conn, action.target_id, new_id, user_id=user_id)
         return new_id
 
     # ADD (and any degraded case)
-    return store.add_fact(conn, fact, embedding, source_episode_id, state)
+    return store.add_fact(conn, fact, embedding, source_episode_id, state,
+                          user_id=user_id)

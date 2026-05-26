@@ -8,6 +8,10 @@
 --   L10 Identity Graph ...... identity
 -- L7 (reconsolidation) and L8 (forgetting) act ON these tables rather than
 -- being tables themselves; L9 (predictive prefetch) reads them.
+--
+-- Every memory row carries ``user_id`` so a single database can host multiple
+-- personas without bleed.  The eval harness assigns a distinct user_id per
+-- scenario; the single-user CLI uses ``'default'``.
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;   -- trigram (BM25-ish) matching for facts
@@ -15,6 +19,7 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;   -- trigram (BM25-ish) matching for fac
 -- L2: event-based autobiographical history. Each row is one stored episode.
 CREATE TABLE IF NOT EXISTS episodes (
     id            BIGSERIAL PRIMARY KEY,
+    user_id       TEXT NOT NULL DEFAULT 'default',  -- per-user namespace
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_access   TIMESTAMPTZ NOT NULL DEFAULT now(),
     role          TEXT NOT NULL,                 -- 'user' | 'assistant'
@@ -31,7 +36,6 @@ CREATE TABLE IF NOT EXISTS episodes (
     reconsolidated_at TIMESTAMPTZ,               -- L7: last time a read mutated it
     abstracted    BOOLEAN NOT NULL DEFAULT FALSE -- L8: rolled up into a belief
 );
-
 CREATE INDEX IF NOT EXISTS episodes_embedding_idx
     ON episodes USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS episodes_vitality_idx ON episodes (vitality);
@@ -43,6 +47,7 @@ CREATE INDEX IF NOT EXISTS episodes_vitality_idx ON episodes (vitality);
 -- TACO-specific and have no Mem0 equivalent.
 CREATE TABLE IF NOT EXISTS facts (
     id            BIGSERIAL PRIMARY KEY,
+    user_id       TEXT NOT NULL DEFAULT 'default',  -- per-user namespace
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -100,6 +105,7 @@ CREATE INDEX IF NOT EXISTS facts_threads_idx ON facts (thread_status) WHERE fact
 -- L3: beliefs abstracted from decayed episodes (meaning outlives the event).
 CREATE TABLE IF NOT EXISTS semantic_beliefs (
     id            BIGSERIAL PRIMARY KEY,
+    user_id       TEXT NOT NULL DEFAULT 'default',
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     belief        TEXT NOT NULL,
     embedding     vector(1536),
@@ -113,6 +119,7 @@ CREATE INDEX IF NOT EXISTS beliefs_embedding_idx
 -- L4: independent, salience-weighted emotional timeline.
 CREATE TABLE IF NOT EXISTS emotional_timeline (
     id            BIGSERIAL PRIMARY KEY,
+    user_id       TEXT NOT NULL DEFAULT 'default',
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     episode_id    BIGINT REFERENCES episodes(id) ON DELETE SET NULL,
     intensity     REAL NOT NULL,                 -- E at the moment
@@ -132,24 +139,70 @@ CREATE TABLE IF NOT EXISTS procedural (
 -- L6: self-generated reflections produced on consolidation.
 CREATE TABLE IF NOT EXISTS reflections (
     id            BIGSERIAL PRIMARY KEY,
+    user_id       TEXT NOT NULL DEFAULT 'default',
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     reflection    TEXT NOT NULL,
     embedding     vector(1536)
 );
 
--- L10: persistent self-model of the user.
+-- L10: persistent self-model of the user.  ``attribute`` is UNIQUE per user.
 CREATE TABLE IF NOT EXISTS identity (
     id            BIGSERIAL PRIMARY KEY,
-    attribute     TEXT NOT NULL UNIQUE,
+    user_id       TEXT NOT NULL DEFAULT 'default',
+    attribute     TEXT NOT NULL,
     value         TEXT NOT NULL,
     confidence    REAL NOT NULL DEFAULT 0.5,
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, attribute)
 );
 
 -- Persisted latent state log so S survives across sessions and feeds the
 -- proactive-initiation job.
 CREATE TABLE IF NOT EXISTS state_log (
     id            BIGSERIAL PRIMARY KEY,
+    user_id       TEXT NOT NULL DEFAULT 'default',
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     s_e REAL NOT NULL, s_k REAL NOT NULL, s_v REAL NOT NULL, s_r REAL NOT NULL
 );
+
+-- --------------------------------------------------------------------------- --
+-- Backward-compatible migration. Existing databases predating the per-user
+-- namespacing get ``user_id`` retro-added before any index references it.
+-- The CREATE TABLE IF NOT EXISTS blocks above are no-ops on an existing
+-- schema, so this ALTER block is what actually adds the column there.
+-- This MUST run before the user_id indexes below.
+-- --------------------------------------------------------------------------- --
+ALTER TABLE episodes           ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE facts              ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE semantic_beliefs   ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE emotional_timeline ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE reflections        ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE identity           ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE state_log          ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default';
+DO $$
+BEGIN
+    -- Old schema had identity.attribute UNIQUE globally; with per-user
+    -- namespacing it must be UNIQUE per (user_id, attribute).
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'identity'::regclass AND conname = 'identity_attribute_key'
+    ) THEN
+        EXECUTE 'ALTER TABLE identity DROP CONSTRAINT identity_attribute_key';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'identity'::regclass AND conname = 'identity_user_id_attribute_key'
+    ) THEN
+        EXECUTE 'ALTER TABLE identity ADD CONSTRAINT identity_user_id_attribute_key UNIQUE (user_id, attribute)';
+    END IF;
+END $$;
+
+-- user_id indexes — declared AFTER the migration so they work whether the
+-- column was created inline (fresh DB) or via the ALTER block (upgrade).
+CREATE INDEX IF NOT EXISTS episodes_user_id_idx          ON episodes          (user_id);
+CREATE INDEX IF NOT EXISTS facts_user_id_idx             ON facts             (user_id);
+CREATE INDEX IF NOT EXISTS beliefs_user_id_idx           ON semantic_beliefs  (user_id);
+CREATE INDEX IF NOT EXISTS emotional_user_id_idx         ON emotional_timeline (user_id);
+CREATE INDEX IF NOT EXISTS reflections_user_id_idx       ON reflections       (user_id);
+CREATE INDEX IF NOT EXISTS identity_user_id_idx          ON identity          (user_id);
+CREATE INDEX IF NOT EXISTS state_log_user_id_idx         ON state_log         (user_id);

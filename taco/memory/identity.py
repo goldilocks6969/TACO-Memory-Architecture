@@ -61,6 +61,7 @@ def reconcile(existing: Optional[Tuple[str, float]], new_value: str,
 def consolidate(conn: psycopg.Connection, content: str, salience: float,
                 state: LatentState,
                 extract_fn: Callable[[str, List[Tuple]], List[dict]],
+                user_id: str = store.DEFAULT_USER_ID,
                 ) -> List[IdentityUpdate]:
     """Update the self-model from one (already-stored) high-salience turn.
 
@@ -70,7 +71,7 @@ def consolidate(conn: psycopg.Connection, content: str, salience: float,
     if salience < config.IDENTITY_SALIENCE_MIN:
         return []
 
-    known = store.identity_snapshot(conn, limit=20)
+    known = store.identity_snapshot(conn, limit=20, user_id=user_id)
     facts = extract_fn(content, known)
 
     applied: List[IdentityUpdate] = []
@@ -79,17 +80,19 @@ def consolidate(conn: psycopg.Connection, content: str, salience: float,
         value = str(f.get("value", "")).strip()
         if not attribute or not value:
             continue
-        existing = store.get_identity(conn, attribute)
+        existing = store.get_identity(conn, attribute, user_id=user_id)
         new_value, conf, changed = reconcile(
             existing, value, float(f.get("confidence", 0.5)))
-        store.upsert_identity(conn, attribute, new_value, conf)
+        store.upsert_identity(conn, attribute, new_value, conf, user_id=user_id)
         applied.append(IdentityUpdate(attribute, new_value, conf, changed))
     return applied
 
 
-def snapshot_lines(conn: psycopg.Connection) -> List[str]:
+def snapshot_lines(conn: psycopg.Connection,
+                   user_id: str = store.DEFAULT_USER_ID) -> List[str]:
     """Render the asserted self-model for the briefing (confident attributes only)."""
     rows = store.identity_snapshot(
         conn, limit=config.IDENTITY_TOP_K,
-        min_confidence=config.IDENTITY_MIN_CONFIDENCE)
+        min_confidence=config.IDENTITY_MIN_CONFIDENCE,
+        user_id=user_id)
     return [f"{attr} — {val} (confidence {conf:.0%})" for attr, val, conf in rows]

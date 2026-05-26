@@ -50,18 +50,26 @@ class TurnResult:
 
 
 class Taco:
-    """The cognitive layer. One instance per user/connection."""
+    """The cognitive layer. One instance per user/connection.
 
-    def __init__(self, conn: psycopg.Connection, working_window: int = 6):
+    Pass a distinct ``user_id`` per logical user (or, in the eval harness, per
+    scenario) — every store read and write is scoped to it, so personas can
+    share a database without bleeding memories into each other.
+    """
+
+    def __init__(self, conn: psycopg.Connection, working_window: int = 6,
+                 user_id: str = store.DEFAULT_USER_ID):
         self.conn = conn
+        self.user_id = user_id
         self.working: deque = deque(maxlen=working_window)  # L1 working memory
-        for ep in store.recent_episodes(conn, limit=working_window):
+        for ep in store.recent_episodes(conn, limit=working_window,
+                                        user_id=user_id):
             self.working.append(ep)
-        self.state = store.last_state(conn) or LatentState()
+        self.state = store.last_state(conn, user_id=user_id) or LatentState()
 
     # ------------------------------------------------------------------ #
     def _hours_since_last(self) -> float:
-        last = store.last_contact_time(self.conn)
+        last = store.last_contact_time(self.conn, user_id=self.user_id)
         if last is None:
             return 0.0
         now = datetime.now(timezone.utc)
@@ -85,36 +93,44 @@ class Taco:
 
         # 4. L9 predictive continuity: read the trajectory of S (incl. this turn)
         #    to anticipate where the user is heading and what to prefetch.
-        history = store.recent_states(self.conn, config.PREDICT_HISTORY) + [self.state]
-        recent_salient = store.recent_salient_episodes(self.conn)
+        history = (store.recent_states(self.conn, config.PREDICT_HISTORY,
+                                       user_id=self.user_id)
+                   + [self.state])
+        recent_salient = store.recent_salient_episodes(self.conn,
+                                                       user_id=self.user_id)
         pred = prediction.predict(history, recent_salient)
 
         # 5. retrieval. Episodes still feed L7 reconsolidation (they are the raw
         #    affective record); FACTS are the retrieval target for the briefing.
         q_emb = embeddings.embed_list(user_message)
-        epi_cands = store.knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
+        epi_cands = store.knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST,
+                                         user_id=self.user_id)
         top_epi = retrieval.rerank(epi_cands, self.state, top_k=config.TOP_K)
-        store.touch_access(self.conn, [m.id for m in top_epi if m.id])
+        store.touch_access(self.conn, [m.id for m in top_epi if m.id],
+                           user_id=self.user_id)
 
         # 6. L7 reconsolidation on the re-held episodes (before beliefs are read).
         current_tone = retrieval.state_tone(self.state)
         recon = reconsolidation.reconsolidate(
             self.conn, top_epi, self.state, current_tone,
-            llm.reconsolidate, embeddings.embed_list)
+            llm.reconsolidate, embeddings.embed_list, user_id=self.user_id)
 
         # 6b. fact retrieval (+ state-gated anticipatory prefetch) → re-rank → top-k.
-        fact_cands = store.fact_knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
+        fact_cands = store.fact_knn_candidates(
+            self.conn, q_emb, config.CANDIDATE_CAST, user_id=self.user_id)
         if pred.prefetch_query and pred.prefetch_query != user_message:
             seen = {c.id for c in fact_cands}
             pf_emb = embeddings.embed_list(pred.prefetch_query)
-            for c in store.fact_knn_candidates(self.conn, pf_emb, config.PREFETCH_K):
+            for c in store.fact_knn_candidates(
+                    self.conn, pf_emb, config.PREFETCH_K, user_id=self.user_id):
                 if c.id not in seen:
                     fact_cands.append(c)
         top = retrieval.rerank(fact_cands, self.state, top_k=config.TOP_K)
         top = self._surface_threads(top)  # open threads always included (Phase 1.6)
 
-        beliefs = store.belief_candidates(self.conn, q_emb, k=2)
-        identity_lines = identity.snapshot_lines(self.conn)  # L10 self-model
+        beliefs = store.belief_candidates(self.conn, q_emb, k=2,
+                                          user_id=self.user_id)
+        identity_lines = identity.snapshot_lines(self.conn, user_id=self.user_id)
 
         # 7. assemble the narrative briefing (stance + self-model + prediction)
         sections = retrieval.briefing_sections(
@@ -133,13 +149,15 @@ class Taco:
         ep_id: Optional[int] = None
         if stored:
             ep = salience.build_episode("user", user_message, analysis)
-            ep_id = store.add_episode(self.conn, ep, q_emb, self.state)
+            ep_id = store.add_episode(self.conn, ep, q_emb, self.state,
+                                      user_id=self.user_id)
             store.add_emotional(self.conn, ep_id, self.state.E,
-                                analysis.get("tone"), analysis["salience"])
+                                analysis.get("tone"), analysis["salience"],
+                                user_id=self.user_id)
             # L10: consolidate identity from significant moments only.
             identity_updates = identity.consolidate(
                 self.conn, user_message, analysis["salience"], self.state,
-                llm.extract_identity)
+                llm.extract_identity, user_id=self.user_id)
 
         # 9b. extract + reconcile structured facts (ADD/UPDATE/MERGE/DELETE/NOOP).
         if light.salience >= self.state.theta_facts():
@@ -147,9 +165,11 @@ class Taco:
 
         # 10. write-back: working memory + persisted state
         self.working.append(Episode(content=user_message, role="user",
-                                    tone=analysis.get("tone")))
-        self.working.append(Episode(content=response, role="assistant"))
-        store.log_state(self.conn, self.state)
+                                    tone=analysis.get("tone"),
+                                    user_id=self.user_id))
+        self.working.append(Episode(content=response, role="assistant",
+                                    user_id=self.user_id))
+        store.log_state(self.conn, self.state, user_id=self.user_id)
 
         return TurnResult(response=response, state=self.state, plan=plan,
                           analysis=analysis, retrieved=top, stored=stored,
@@ -166,14 +186,17 @@ class Taco:
         full = extract.full_extract(user_message, light)
         for fact in full.facts:
             f_emb = embeddings.embed_list(fact.summary)
-            neighbors = store.fact_neighbors(self.conn, f_emb, k=3, min_sim=0.7)
+            neighbors = store.fact_neighbors(self.conn, f_emb, k=3, min_sim=0.7,
+                                             user_id=self.user_id)
             action = operations.decide_action(fact, neighbors)
             operations.apply(self.conn, action, fact, f_emb,
-                             source_episode_id, self.state)
+                             source_episode_id, self.state,
+                             user_id=self.user_id)
 
     def _surface_threads(self, top: List[Episode]) -> List[Episode]:
         """Always include open threads due within 7 days, regardless of score."""
-        threads = store.due_threads(self.conn, within_days=7)
+        threads = store.due_threads(self.conn, within_days=7,
+                                    user_id=self.user_id)
         if not threads:
             return top
         have = {m.id for m in top}
@@ -195,14 +218,19 @@ class Taco:
         state = infer_state(self.state, signal, 0.5)  # transient, not persisted
         plan = orchestrator.plan(state)
 
-        history = store.recent_states(self.conn, config.PREDICT_HISTORY) + [state]
-        pred = prediction.predict(history, store.recent_salient_episodes(self.conn))
+        history = (store.recent_states(self.conn, config.PREDICT_HISTORY,
+                                       user_id=self.user_id)
+                   + [state])
+        pred = prediction.predict(
+            history, store.recent_salient_episodes(self.conn, user_id=self.user_id))
 
         q_emb = embeddings.embed_list(user_message)
-        fact_cands = store.fact_knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST)
+        fact_cands = store.fact_knn_candidates(
+            self.conn, q_emb, config.CANDIDATE_CAST, user_id=self.user_id)
         top = self._surface_threads(retrieval.rerank(fact_cands, state, top_k=config.TOP_K))
-        beliefs = store.belief_candidates(self.conn, q_emb, k=2)
-        identity_lines = identity.snapshot_lines(self.conn)
+        beliefs = store.belief_candidates(self.conn, q_emb, k=2,
+                                          user_id=self.user_id)
+        identity_lines = identity.snapshot_lines(self.conn, user_id=self.user_id)
         sections = retrieval.briefing_sections(
             top, beliefs, list(self.working), state, plan.stance,
             identity=identity_lines, prediction=pred)
@@ -217,4 +245,4 @@ class Taco:
     def run_decay(self, extra_weeks: float = 0.0) -> decay.DecayReport:
         """Run the forgetting engine (tier decay + abstraction-before-pruning)."""
         return decay.run(self.conn, embeddings.embed_list, llm.abstract,
-                         extra_weeks=extra_weeks)
+                         extra_weeks=extra_weeks, user_id=self.user_id)

@@ -18,6 +18,7 @@ class Fact:
     """One structured memory. Mirrors a row of the `facts` table."""
 
     summary: str
+    user_id: str = "default"               # per-user namespace; set by store on read-back
     fact_type: Optional[str] = None        # preference|event|relationship|state|thread
     event_type: Optional[str] = None       # conflict|goal|fear|plan|achievement|...
     emotional_tone: Optional[str] = None

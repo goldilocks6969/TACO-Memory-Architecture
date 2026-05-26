@@ -219,6 +219,38 @@ The harness prints two warnings to make this explicit:
 The legacy single-number `CES` is retained as an alias for `CES_retrieval` so
 older reports still resolve.
 
+### State-briefing verbosity (`TACO_STATE_BRIEFING_MODE`)
+
+TACO's structured state briefing is what makes `CES_total` lower than
+`CES_retrieval` — it adds overhead on top of the retrieved memories. The
+verbosity is controlled by `TACO_STATE_BRIEFING_MODE`:
+
+| Mode      | Budget (state-briefing tokens / turn) | Contents | When to use |
+|-----------|--------------------------------------:|----------|-------------|
+| `full`    | unbounded (~280 in practice) | state line + full reasoning stance + identity + working memory + predictive continuity | Debug / qualitative inspection |
+| `compact` | **≤ 80** (hard cap) | tight one-line state + stance label + condensed identity (3 attributes, no confidences) | **Eval default** |
+| `minimal` | **≤ 35** (hard cap) | single `[state tone=…, stance=…]` tag | Total-context-efficiency ablations |
+
+The hard cap is enforced by token truncation in `taco/memory/retrieval.py`
+(`STATE_BRIEFING_COMPACT_MAX_TOKENS`, `STATE_BRIEFING_MINIMAL_MAX_TOKENS` —
+both overridable via env). The retrieved memory payload is **not** affected
+by the mode; the harness charges retrieval and state-briefing tokens
+separately so `CES_retrieval` and `CES_total` remain comparable.
+
+```bash
+# eval default — compact briefing, honest CES_total
+python3 -m eval.run
+
+# debug run — verbose briefing
+TACO_STATE_BRIEFING_MODE=full python3 -m eval.run
+
+# total-context ablation — strip the briefing to a single tag
+TACO_STATE_BRIEFING_MODE=minimal python3 -m eval.run
+```
+
+The selected mode is recorded in `summary.json` under `meta.state_briefing_mode`
+and printed in the harness progress log.
+
 ### What the harness records per probe
 
 `retrieval_tokens`, `state_briefing_tokens`, `memory_context_tokens`,

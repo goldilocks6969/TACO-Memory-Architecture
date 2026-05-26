@@ -145,7 +145,7 @@ def analyze(text: str) -> Dict:
                   {"role": "user", "content": text}],
         temperature=0,
         response_format={"type": "json_object"},
-    ))
+    ), label="llm.analyze")
     data = json.loads(resp.choices[0].message.content)
     return {
         "emotional": float(data.get("emotional", 0)),
@@ -165,7 +165,7 @@ def respond(system_brief: str, user_message: str, planning_depth: int) -> str:
         messages=[{"role": "system", "content": system_brief},
                   {"role": "user", "content": user_message}],
         temperature=0.7,
-    ))
+    ), label="llm.respond")
     return resp.choices[0].message.content.strip()
 
 
@@ -230,7 +230,7 @@ def abstract(texts: List[str]) -> str:
         messages=[{"role": "system", "content": sys},
                   {"role": "user", "content": "\n".join(f"- {t}" for t in texts)}],
         temperature=0.3,
-    ))
+    ), label="llm.abstract")
     return resp.choices[0].message.content.strip()
 
 
@@ -287,7 +287,7 @@ def extract_identity(text: str, existing: List[tuple] | None = None) -> List[Dic
                       {"role": "user", "content": f"KNOWN: {known}\nMESSAGE: {text}"}],
             temperature=0,
             response_format={"type": "json_object"},
-        ))
+        ), label="llm.extract_identity")
         facts = json.loads(resp.choices[0].message.content).get("facts", [])
         clean: List[Dict] = []
         for f in facts:
@@ -332,7 +332,7 @@ def reconsolidate(original: str, original_tone: str, current_tone: str) -> str:
                           f"ORIGINAL (tone={original_tone}): {original}\n"
                           f"CURRENT tone: {current_tone}")}],
             temperature=0.4,
-        ))
+        ), label="llm.reconsolidate")
         return resp.choices[0].message.content.strip()
     except Exception:
         stem = original.strip().rstrip(".")

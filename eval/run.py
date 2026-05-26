@@ -1,10 +1,19 @@
 """Run the continuity benchmark and emit results, figures, and the report.
 
     python -m eval.run
+
+Debuggability: every major step prints a flushed progress line, and
+``eval/out/run_started.txt`` is written the moment the process begins, so a
+silent hang during imports/connect/etc. is immediately distinguishable from
+"never started at all".  ``TACO_MOCK=1`` exercises the full pipeline without
+any external API call.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
+import sys
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -13,6 +22,24 @@ from taco import config
 from . import harness, metrics, plots
 
 OUT = Path(__file__).resolve().parent / "out"
+
+
+def _log(msg: str) -> None:
+    """Flushed progress log, mirrored to stderr-friendly stdout."""
+    print(f"[run] {msg}", flush=True)
+
+
+def _mark_started() -> None:
+    """Create OUT and drop a tiny start-marker so the user can tell the process
+    actually launched (vs. hanging on imports / DB connect / etc.)."""
+    OUT.mkdir(parents=True, exist_ok=True)
+    marker = OUT / "run_started.txt"
+    marker.write_text(
+        f"started_at={_dt.datetime.now().isoformat(timespec='seconds')}\n"
+        f"pid={Path('/proc/self').exists() and __import__('os').getpid() or 0}\n"
+        f"mock={int(config.MOCK)}\n"
+        f"model={config.LLM_MODEL}\n"
+    )
 
 
 def _fmt(v) -> str:
@@ -40,7 +67,8 @@ def _write_report(agg: Dict, rows: List[Dict]) -> Path:
     L.append("# Continuity-Dependent Memory Orchestration: An Evaluation")
     L.append("")
     L.append(f"*Base model: `{agg['meta'].get('model','?')}` (identical in both "
-             f"conditions) · {agg['n_probes']} probes · 8 multi-session personas.*")
+             f"conditions) · {agg['n_probes']} probes · 8 multi-session personas "
+             f"· state_briefing_mode=`{agg['meta'].get('state_briefing_mode','?')}`.*")
     L.append("")
     L.append("## Summary")
     L.append("")
@@ -217,15 +245,34 @@ def _write_report(agg: Dict, rows: List[Dict]) -> Path:
 
 
 def main() -> None:
-    OUT.mkdir(parents=True, exist_ok=True)
+    t0 = time.monotonic()
+    _mark_started()
+    _log(f"starting eval.run · mock={int(config.MOCK)} · model={config.LLM_MODEL}")
+    _log(f"output dir: {OUT}")
+
+    _log("invoking harness.run() ...")
     result = harness.run()
+    _log(f"harness.run() returned {len(result['rows'])} rows "
+         f"({time.monotonic() - t0:.1f}s elapsed)")
+
+    _log("writing results.json")
     (OUT / "results.json").write_text(json.dumps(result["rows"], indent=2))
 
+    _log("aggregating metrics")
     agg = metrics.aggregate(result)
+
+    _log("writing summary.json")
     (OUT / "summary.json").write_text(json.dumps(agg, indent=2))
+
+    _log("writing summary.csv")
     summary_csv = metrics.write_summary_csv(agg, OUT / "summary.csv")
+
+    _log("rendering plots")
     plots.make_all(agg, str(OUT))
+
+    _log("writing report.md")
     report = _write_report(agg, result["rows"])
+    _log(f"all artifacts written ({time.monotonic() - t0:.1f}s total)")
 
     print("\n=== continuity benchmark (revised) ===")
     print(f"overall continuity : RAG {agg['overall']['rag']:.0f}  Taco {agg['overall']['taco']:.0f}")

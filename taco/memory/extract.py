@@ -202,7 +202,7 @@ def light_extract(text: str) -> LightExtract:
                   {"role": "user", "content": text}],
         temperature=0,
         response_format={"type": "json_object"},
-    ))
+    ), label="extract.light_extract")
     try:
         d = json.loads(resp.choices[0].message.content)
     except Exception:
@@ -227,7 +227,7 @@ def full_extract(text: str, light: LightExtract) -> FullExtract:
                   {"role": "user", "content": text}],
         temperature=0.2,
         response_format={"type": "json_object"},
-    ))
+    ), label="extract.full_extract")
     try:
         raw = json.loads(resp.choices[0].message.content).get("facts", [])
     except Exception:

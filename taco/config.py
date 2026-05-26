@@ -42,6 +42,36 @@ MOCK = os.getenv("TACO_MOCK", "0") == "1"
 
 
 # --------------------------------------------------------------------------- #
+# State-briefing verbosity — controls how much of the structured TACO state is
+# rendered into the LLM prompt.  Trades fidelity for total-context efficiency
+# (CES_total).  Read at call time from ``config.STATE_BRIEFING_MODE`` so the
+# eval harness can override it without re-importing.
+#
+#   full     — full state line + reasoning stance + identity + working memory
+#              + predictive continuity.  Best for debugging / CLI; verbose.
+#   compact  — tight one-line state + stance label + condensed identity.
+#              Hard-capped at STATE_BRIEFING_COMPACT_MAX_TOKENS (default 80).
+#              **The eval harness default.**
+#   minimal  — single bracketed tag with tone + stance only.  Hard-capped at
+#              STATE_BRIEFING_MINIMAL_MAX_TOKENS (default 35).
+# --------------------------------------------------------------------------- #
+_VALID_BRIEFING_MODES = ("full", "compact", "minimal")
+STATE_BRIEFING_MODE = os.getenv("TACO_STATE_BRIEFING_MODE", "full").strip().lower()
+if STATE_BRIEFING_MODE not in _VALID_BRIEFING_MODES:
+    raise RuntimeError(
+        f"TACO_STATE_BRIEFING_MODE={STATE_BRIEFING_MODE!r} is invalid; "
+        f"expected one of {_VALID_BRIEFING_MODES}"
+    )
+
+STATE_BRIEFING_COMPACT_MAX_TOKENS = int(
+    os.getenv("TACO_STATE_BRIEFING_COMPACT_MAX_TOKENS", "80")
+)
+STATE_BRIEFING_MINIMAL_MAX_TOKENS = int(
+    os.getenv("TACO_STATE_BRIEFING_MINIMAL_MAX_TOKENS", "35")
+)
+
+
+# --------------------------------------------------------------------------- #
 # Retrieval scoring R(m) — §4.2
 #   R(m) = w_sem·sem + w_sal·sal + w_emo·emo + w_rec·rec + w_decay·decay
 # --------------------------------------------------------------------------- #
