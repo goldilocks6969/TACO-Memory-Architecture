@@ -224,6 +224,12 @@ def run() -> Dict:
     if "TACO_EVAL_SKIP_RESPOND_DURING_INGEST" not in os.environ:
         config.SKIP_RESPOND_DURING_INGEST = True
 
+    # Identity extraction is a product feature, but not needed for the scored
+    # benchmark replay. Default it off during ingest to avoid live LLM calls
+    # before probes; TACO_EVAL_SKIP_IDENTITY_DURING_INGEST=0 re-enables it.
+    if "TACO_EVAL_SKIP_IDENTITY_DURING_INGEST" not in os.environ:
+        config.SKIP_IDENTITY_DURING_INGEST = True
+
     # Eval defaults to the LOCAL heuristic light extractor — even when an API
     # key is configured.  The LLM-backed light tier can wedge during ingest in
     # the same way ``respond`` can; the heuristic carries every field the
@@ -264,6 +270,7 @@ def run() -> Dict:
          f"· state_briefing_mode={config.STATE_BRIEFING_MODE} "
          f"· extraction_mode={config.EXTRACTION_MODE} "
          f"· skip_respond_during_ingest={int(config.SKIP_RESPOND_DURING_INGEST)} "
+         f"· skip_identity_during_ingest={int(config.SKIP_IDENTITY_DURING_INGEST)} "
          f"· light_extract_local={int(config.LIGHT_EXTRACT_LOCAL)} "
          f"· fast_responses={int(config.FAST_RESPONSES)} "
          f"· fast_live={int(config.FAST_LIVE)} "

@@ -80,7 +80,7 @@ def judge(probe_text: str, ground_truth: str, kind: str, response: str) -> Dict:
         )
 
     from taco.llm import _client
-    from taco.retry import with_retries
+    from taco.retry import CallTimeout, with_retries
 
     raw_output = ""
     try:
@@ -92,12 +92,15 @@ def judge(probe_text: str, ground_truth: str, kind: str, response: str) -> Dict:
             response_format={"type": "json_object"},
             max_tokens=config.JUDGE_MAX_TOKENS,
             timeout=config.LLM_REQUEST_TIMEOUT_S,
-        ), label=f"judge[{kind}]")
+        ), label=f"judge[{kind}]",
+            timeout_per_attempt=config.LLM_REQUEST_TIMEOUT_S)
         raw_output = resp.choices[0].message.content
         data = json.loads(raw_output)
         score = int(max(0, min(100, float(data.get("score", 0)))))
         return {"score": score, "reason": str(data.get("reason", ""))[:200],
                 "input_text": input_text, "output_text": raw_output}
+    except CallTimeout:
+        raise
     except Exception as e:  # robust to endpoints lacking json mode, etc.
         m = re.search(r'"?score"?\s*[:=]\s*(\d+)', raw_output)
         return {"score": int(m.group(1)) if m else 0,

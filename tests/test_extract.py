@@ -54,3 +54,36 @@ def test_full_extract_flags_open_thread():
 def test_transactional_turn_is_low_salience():
     le = extract.light_extract("what time does the post office close on fridays?")
     assert le.salience < 4                        # filler should not clear θ_facts
+
+
+def test_light_facts_preserve_quiet_nickname_anchor():
+    text = "he always called me 'kiddo'"
+    le = extract.light_extract(text)
+    facts = extract.light_facts(text, le)
+    assert any("kiddo" in f.summary.lower() for f in facts)
+    assert extract.has_memory_anchor(text, le)
+
+
+def test_light_facts_preserve_career_outcome_anchor():
+    text = "I GOT THE JOB at Halcyon. better pay even. I could cry"
+    le = extract.light_extract(text)
+    facts = extract.light_facts(text, le)
+    assert any("halcyon" in f.summary.lower() and "hired" in f.summary.lower()
+               for f in facts)
+    assert any("career outcome" in f.retrieval_cues for f in facts)
+
+
+def test_light_facts_preserve_health_progress_anchor():
+    text = "my A1C dropped a little at the recheck. small win"
+    le = extract.light_extract(text)
+    facts = extract.light_facts(text, le)
+    assert any("a1c dropped" in f.summary.lower() for f in facts)
+    assert any("health progress" in f.retrieval_cues for f in facts)
+
+
+def test_light_facts_preserve_unresolved_relationship_thread():
+    text = "Sam reached out. wants to 'talk'. I don't know if I can"
+    le = extract.light_extract(text)
+    facts = extract.light_facts(text, le)
+    assert any(f.fact_type == "thread" and f.thread_status == "unresolved"
+               for f in facts), (le, facts)

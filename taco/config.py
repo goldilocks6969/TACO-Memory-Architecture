@@ -113,6 +113,13 @@ SKIP_RESPOND_DURING_INGEST = (
     os.getenv("TACO_EVAL_SKIP_RESPOND_DURING_INGEST", "0").strip() == "1"
 )
 
+# Identity extraction is useful product behavior, but it is not part of the
+# scored replay path and costs an LLM call on high-salience turns. Eval can skip
+# it during ingest-only turns; normal product turns still consolidate identity.
+SKIP_IDENTITY_DURING_INGEST = (
+    os.getenv("TACO_EVAL_SKIP_IDENTITY_DURING_INGEST", "0").strip() == "1"
+)
+
 
 # --------------------------------------------------------------------------- #
 # Local light-extract — force the keyless heuristic path inside
@@ -266,6 +273,17 @@ RECENCY_WINDOW_DAYS = 30     # rec(m) is recency within a 30-day window
 
 CANDIDATE_CAST = 20  # pgvector kNN candidates (Figure 4 step 1)
 TOP_K = 6            # memories assembled into the briefing (Figure 4 step 3)
+
+# --------------------------------------------------------------------------- #
+# Adaptive sparse recall — state-aware retrieval payload control
+# --------------------------------------------------------------------------- #
+RECALL_POLICY = os.getenv("TACO_RECALL_POLICY", "adaptive").strip().lower()
+RECALL_MAX_TOKENS = int(os.getenv("TACO_RECALL_MAX_TOKENS", "80"))
+RECALL_FACTUAL_K = int(os.getenv("TACO_RECALL_FACTUAL_K", "2"))
+RECALL_EMOTIONAL_K = int(os.getenv("TACO_RECALL_EMOTIONAL_K", "2"))
+RECALL_COHERENCE_K = int(os.getenv("TACO_RECALL_COHERENCE_K", "3"))
+RECALL_GENERAL_K = int(os.getenv("TACO_RECALL_GENERAL_K", "2"))
+RECALL_FILLER_K = int(os.getenv("TACO_RECALL_FILLER_K", "0"))
 
 
 # --------------------------------------------------------------------------- #

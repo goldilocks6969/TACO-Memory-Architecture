@@ -87,6 +87,13 @@ def _write_report(agg: Dict, rows: List[Dict]) -> Path:
              "salience-weighted recall; (ii) lower and bounded *retrieval* "
              "overhead; and (iii) higher continuity per retrieval token (CES).")
     L.append("")
+    L.append("Architecturally, the distinction is write-time salience plus "
+             "state-conditioned sparse recall. Naive RAG retrieves top-k chunks "
+             "by similarity; Mem0-style systems extract useful memories and "
+             "retrieve relevant ones; Taco adds an encoding-time admission policy "
+             "and a state-conditioned recall budget, so emotional/contextual "
+             "state changes what is stored and how much reaches the prompt.")
+    L.append("")
 
     # headline numbers
     L.append("## Headline metrics")

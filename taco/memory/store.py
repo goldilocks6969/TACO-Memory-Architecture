@@ -174,13 +174,20 @@ def _fact_row_to_episode(r) -> Episode:
     are episode-shaped) can consume facts unchanged in Phase 1.
 
     Row shape: (id, user_id, summary, salience, vitality, tone, created_at,
-                similarity).
+                similarity[, fact_type, event_type, thread_status,
+                retrieval_cues]).
     """
-    return Episode(
+    ep = Episode(
         id=r[0], user_id=r[1], role="memory", content=r[2],
         salience=float(r[3]), vitality=float(r[4]), tone=r[5],
         created_at=r[6], similarity=max(0.0, float(r[7])),
     )
+    if len(r) > 8:
+        ep.fact_type = r[8]
+        ep.event_type = r[9]
+        ep.thread_status = r[10]
+        ep.retrieval_cues = list(r[11] or [])
+    return ep
 
 
 def fact_knn_candidates(conn: psycopg.Connection, query_embedding: List[float],
@@ -194,7 +201,8 @@ def fact_knn_candidates(conn: psycopg.Connection, query_embedding: List[float],
     rows = conn.execute(
         f"""
         SELECT id, user_id, summary, salience, vitality, emotional_tone, created_at,
-               1 - (embedding <=> %s) AS similarity
+               1 - (embedding <=> %s) AS similarity,
+               fact_type, event_type, thread_status, retrieval_cues
         FROM facts
         WHERE {where}
         ORDER BY embedding <=> %s
@@ -298,7 +306,8 @@ def fact_text_search(conn: psycopg.Connection, query_text: str, k: int = 20,
         return []
     sql = """
         SELECT id, user_id, summary, salience, vitality, emotional_tone,
-               created_at, similarity(summary, %s) AS sim
+               created_at, similarity(summary, %s) AS sim,
+               fact_type, event_type, thread_status, retrieval_cues
         FROM facts
         WHERE user_id = %s AND validity = 'current'
               AND summary %% %s
@@ -328,7 +337,8 @@ def fact_cue_search(conn: psycopg.Connection, query_text: str, k: int = 20,
         return []
     sql = """
         SELECT id, user_id, summary, salience, vitality, emotional_tone,
-               created_at, similarity(COALESCE(cues_text, ''), %s) AS sim
+               created_at, similarity(COALESCE(cues_text, ''), %s) AS sim,
+               fact_type, event_type, thread_status, retrieval_cues
         FROM facts
         WHERE user_id = %s AND validity = 'current'
               AND cues_text IS NOT NULL
@@ -361,7 +371,8 @@ def fact_entity_overlap(conn: psycopg.Connection, entity_keys: List[str],
         SELECT id, user_id, summary, salience, vitality, emotional_tone,
                created_at,
                cardinality(ARRAY(SELECT unnest(entity_keys)
-                                 INTERSECT SELECT unnest(%s::text[]))) AS overlap
+                                 INTERSECT SELECT unnest(%s::text[]))) AS overlap,
+               fact_type, event_type, thread_status, retrieval_cues
         FROM facts
         WHERE user_id = %s AND validity = 'current'
               AND entity_keys && %s::text[]
@@ -381,7 +392,8 @@ def due_threads(conn: psycopg.Connection, within_days: int = 7,
     rows = conn.execute(
         """
         SELECT id, user_id, summary, salience, vitality, emotional_tone,
-               created_at, 1.0
+               created_at, 1.0,
+               fact_type, event_type, thread_status, retrieval_cues
         FROM facts
         WHERE user_id = %s AND fact_type = 'thread'
               AND thread_status = 'unresolved'

@@ -84,6 +84,23 @@ def test_generate_response_false_still_writes_memory(conn, monkeypatch):
     assert taco.extraction_stats["light_facts_created"] == 1
 
 
+def test_generate_response_false_can_skip_identity_extraction(conn, monkeypatch):
+    """Eval replay can skip identity extraction while preserving episode/fact
+    writes. Product turns still consolidate identity by default."""
+    monkeypatch.setattr(config, "SKIP_IDENTITY_DURING_INGEST", True)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("identity extraction should be skipped")
+
+    monkeypatch.setattr(llm, "extract_identity", _boom)
+    taco = Taco(conn, user_id="skip_identity")
+    taco.turn("My father passed away last night from a heart attack",
+              hours_since_last=0.5, generate_response=False)
+
+    assert _count(conn, "episodes", "skip_identity") == 1
+    assert _count(conn, "facts", "skip_identity") == 1
+
+
 def test_default_turn_still_calls_respond(conn, monkeypatch):
     """Product behaviour unchanged: ``generate_response`` defaults to True."""
     calls = {"n": 0}

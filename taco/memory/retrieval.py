@@ -9,6 +9,7 @@ R(m), selects the top 4, and assembles them into a single narrative briefing.
 """
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from .episode import Episode
@@ -83,14 +84,179 @@ def rerank(candidates: List[Episode], state: LatentState,
 
 
 # --------------------------------------------------------------------------- #
+# Adaptive sparse recall — query intent → recall budget
+# --------------------------------------------------------------------------- #
+_FILLER_RE = re.compile(
+    r"\b(first chat|first ask|recommend|capital|post office|water bottle|"
+    r"wifi|kettle|carpet|garlic|baking soda|baking powder|gift|hotel)\b",
+    re.I,
+)
+_COHERENCE_RE = re.compile(
+    r"\b(am i|are we|how am i|how are we|progress|stable|settled|over it|"
+    r"fully over|making any|where am i|right now|at this point|headway)\b",
+    re.I,
+)
+_EMOTIONAL_RE = re.compile(
+    r"\b(why|what's going on|unpack|thoughts|feeling|felt|feel|lost it|"
+    r"alienated|stomach dropped|surge of anger|welled up|pull over|sick)\b",
+    re.I,
+)
+_FACTUAL_RE = re.compile(
+    r"\b(what|where|which|who|when|name|called|medication|condition|company|"
+    r"city|class|grade|concept|partner|dad|doctor|hired)\b",
+    re.I,
+)
+
+
+def classify_query(query: str) -> str:
+    """Cheap query intent classifier for sparse recall.
+
+    No LLM call: the point is to decide how much memory should reach the prompt,
+    not to understand the full answer. Order matters: coherence/emotional probes
+    often start with "what/why" but need continuity, not fact-only recall.
+    """
+    q = (query or "").strip()
+    if not q:
+        return "general"
+    if _FILLER_RE.search(q):
+        return "filler"
+    if _EMOTIONAL_RE.search(q):
+        return "emotional"
+    if _COHERENCE_RE.search(q):
+        return "coherence"
+    if _FACTUAL_RE.search(q):
+        return "factual"
+    return "general"
+
+
+def recall_budget(query_kind: str) -> int:
+    if config.RECALL_POLICY != "adaptive":
+        return config.TOP_K
+    return {
+        "factual": config.RECALL_FACTUAL_K,
+        "emotional": config.RECALL_EMOTIONAL_K,
+        "coherence": config.RECALL_COHERENCE_K,
+        "filler": config.RECALL_FILLER_K,
+        "general": config.RECALL_GENERAL_K,
+    }.get(query_kind, config.RECALL_GENERAL_K)
+
+
+def _norm_words(text: str) -> set:
+    return {
+        w for w in re.findall(r"[a-z0-9']+", (text or "").lower())
+        if len(w) > 2 and w not in {
+            "the", "and", "for", "that", "this", "with", "user", "users",
+            "their", "them", "they", "from", "about", "into", "was", "were",
+        }
+    }
+
+
+def _redundant(a: Episode, b: Episode) -> bool:
+    aw, bw = _norm_words(a.content), _norm_words(b.content)
+    if not aw or not bw:
+        return False
+    small, large = (aw, bw) if len(aw) <= len(bw) else (bw, aw)
+    if len(small) < 2:
+        return False
+    overlap = len(small & large) / max(1, len(small))
+    return overlap >= 0.66
+
+
+def _prefer_memory(a: Episode, b: Episode) -> Episode:
+    """Prefer concise anchors unless the longer trace is much more important."""
+    a_len, b_len = _count_tokens(a.content), _count_tokens(b.content)
+    if abs(a.salience - b.salience) >= 3:
+        return a if a.salience > b.salience else b
+    if getattr(a, "fact_type", None) and not getattr(b, "fact_type", None):
+        return a
+    if getattr(b, "fact_type", None) and not getattr(a, "fact_type", None):
+        return b
+    return a if a_len <= b_len else b
+
+
+def collapse_redundant(candidates: List[Episode]) -> List[Episode]:
+    out: List[Episode] = []
+    for cand in candidates:
+        replaced = False
+        for i, kept in enumerate(out):
+            if _redundant(cand, kept):
+                out[i] = _prefer_memory(cand, kept)
+                replaced = True
+                break
+        if not replaced:
+            out.append(cand)
+    return sorted(out, key=lambda e: e.score, reverse=True)
+
+
+def _query_overlap(ep: Episode, query_text: str) -> float:
+    q = _norm_words(query_text)
+    if not q:
+        return 0.0
+    mem = _norm_words(ep.content)
+    for cue in getattr(ep, "retrieval_cues", []) or []:
+        mem |= _norm_words(cue)
+    if not mem:
+        return 0.0
+    return len(q & mem) / max(1, len(q))
+
+
+def _boost_for_kind(ep: Episode, query_kind: str, state: LatentState,
+                    query_text: str = "") -> float:
+    ft = getattr(ep, "fact_type", None)
+    et = getattr(ep, "event_type", None)
+    thread = getattr(ep, "thread_status", None)
+    boost = 0.0
+    if query_kind == "factual":
+        boost += _query_overlap(ep, query_text) * 0.45
+        if ft in ("relationship", "state", "event"):
+            boost += 0.08
+        if et in ("identity", "health", "achievement", "relationship"):
+            boost += 0.06
+    elif query_kind == "emotional":
+        boost += ep.salience / 100.0
+        boost += tone_compat(state_tone(state), ep.tone) * 0.08
+    elif query_kind == "coherence":
+        boost += _query_overlap(ep, query_text) * 0.08
+        if thread in ("unresolved", "in_progress"):
+            boost += 0.10
+        if et in ("achievement", "health", "plan", "relationship"):
+            boost += 0.08
+    return boost
+
+
+def select_sparse_recall(candidates: List[Episode], state: LatentState,
+                         query_kind: str, query_text: str = "") -> List[Episode]:
+    """Apply biological-style sparse recall after candidate retrieval.
+
+    RAG dumps a fixed top-k. TACO admits memories at write time, then lets
+    current state and query intent decide how many traces reach the prompt.
+    """
+    if config.RECALL_POLICY != "adaptive":
+        return candidates[:config.TOP_K]
+    budget = recall_budget(query_kind)
+    if budget <= 0:
+        return []
+    adjusted = list(candidates)
+    for ep in adjusted:
+        ep.score += _boost_for_kind(ep, query_kind, state, query_text)
+    adjusted = sorted(adjusted, key=lambda e: e.score, reverse=True)
+    collapsed = collapse_redundant(adjusted)
+    return collapsed[:budget]
+
+
+# --------------------------------------------------------------------------- #
 # Context assembly (Figure 4 step 4)
 # --------------------------------------------------------------------------- #
-_SYSTEM_PROMPT = (
+_SYSTEM_PROMPT_FULL = (
     "You are the reasoning engine inside a state-dependent cognitive memory "
     "layer. A separate system has inferred the user's current state and "
     "selected the most relevant memories. Respond naturally; let the state, "
     "the memories, and the reasoning directives below shape both what you say "
     "and what you choose to do."
+)
+
+_SYSTEM_PROMPT_COMPACT = (
+    "Answer from the state tag and retrieved memories; preserve continuity."
 )
 
 
@@ -129,27 +295,28 @@ def _truncate_to_budget(text: str, max_tokens: int) -> str:
 
 def _compact_state_section(state: LatentState,
                            stance: Optional["ReasoningStance"]) -> str:
-    """Tight one-line state for ``compact`` mode (target ≤ 80 tokens combined
-    with the identity section). Drops the verbose dimension labels and the
-    reasoning-directive bullets, keeps the stance label and its one-line
-    epistemic framing."""
-    head = (f"State: tone={state_tone(state)}, E={state.E:.0f}, V={state.V:.0f}, "
-            f"K={state.K:.0f}, R={state.R:.0f}.")
-    if stance is None:
-        return head
-    return f"{head} Stance: {stance.mode} — {stance.memory_status}"
+    """Dense state tag for ``compact`` mode.
+
+    The LLM does not need prose explaining the state on every turn; it needs
+    the decision variables. Full mode keeps the human-readable directives for
+    debugging, while compact mode keeps the behavioral signal in ~15 tokens.
+    """
+    mode = stance.mode if stance is not None else "neutral"
+    return (f"[S tone={state_tone(state)} stance={mode} "
+            f"E={state.E:.0f} V={state.V:.0f} K={state.K:.0f} R={state.R:.0f}]")
 
 
 def _compact_identity_section(identity: Optional[List[str]]) -> str:
-    """Single-line identity for ``compact`` mode: up to 3 attributes, no
-    confidence percentages."""
+    """Tiny identity tag for ``compact`` mode: top attribute only, no
+    confidence percentages or prose."""
     if not identity:
         return ""
     short = []
-    for line in identity[:3]:
+    for line in identity[:1]:
         # incoming line shape: "attr — value (confidence X%)"
-        short.append(line.split(" (confidence")[0])
-    return "Who: " + "; ".join(short) + "."
+        item = line.split(" (confidence")[0].replace(" — ", "=")
+        short.append(item)
+    return "[ID " + "; ".join(short) + "]"
 
 
 def _minimal_state_section(state: LatentState,
@@ -159,6 +326,29 @@ def _minimal_state_section(state: LatentState,
     our ablations: the current tone and the resolved stance."""
     mode = stance.mode if stance is not None else "neutral"
     return f"[state tone={state_tone(state)}, stance={mode}]"
+
+
+def _compact_memory_line(memory: Episode) -> str:
+    text = " ".join(memory.content.strip().split())
+    if len(text) > 180:
+        text = text[:179].rsplit(" ", 1)[0].rstrip() + "…"
+    return f"- {text}"
+
+
+def _fit_retrieval_budget(lines: List[str], max_tokens: int) -> List[str]:
+    if max_tokens <= 0:
+        return lines
+    kept: List[str] = []
+    for line in lines:
+        trial = kept + [line]
+        if _count_tokens("\n".join(trial)) <= max_tokens:
+            kept.append(line)
+            continue
+        remaining = max_tokens - _count_tokens("\n".join(kept))
+        if remaining > 8:
+            kept.append(_truncate_to_budget(line, remaining))
+        break
+    return kept
 
 
 def briefing_sections(
@@ -246,25 +436,35 @@ def briefing_sections(
     # charges these tokens separately from the state briefing.
     # ------------------------------------------------------------------
     retrieval_lines: List[str] = []
-    if beliefs:
-        retrieval_lines.append("Durable, identity-level beliefs about this person:")
-        for b in beliefs:
-            retrieval_lines.append(f"  • {b}")
-    if memories:
-        if retrieval_lines:
-            retrieval_lines.append("")
-        retrieval_lines.append(
-            "Psychologically privileged memories (re-ranked by R(m), most "
-            "significant first):"
-        )
-        for m in memories:
+    if mode == "full":
+        if beliefs:
+            retrieval_lines.append("Durable, identity-level beliefs about this person:")
+            for b in beliefs:
+                retrieval_lines.append(f"  • {b}")
+        if memories:
+            if retrieval_lines:
+                retrieval_lines.append("")
             retrieval_lines.append(
-                f"  • [{m.tone or 'neutral'}, salience {m.salience:.0f}/10, "
-                f"R={m.score:.2f}] {m.content}"
+                "Psychologically privileged memories (re-ranked by R(m), most "
+                "significant first):"
             )
+            for m in memories:
+                retrieval_lines.append(
+                    f"  • [{m.tone or 'neutral'}, salience {m.salience:.0f}/10, "
+                    f"R={m.score:.2f}] {m.content}"
+                )
+    else:
+        if beliefs or memories:
+            retrieval_lines.append("M:")
+        for b in beliefs[:1]:
+            retrieval_lines.append(f"- {b}")
+        for m in memories:
+            retrieval_lines.append(_compact_memory_line(m))
+        retrieval_lines = _fit_retrieval_budget(
+            retrieval_lines, config.RECALL_MAX_TOKENS)
 
     sections = {
-        "system": _SYSTEM_PROMPT,
+        "system": _SYSTEM_PROMPT_FULL if mode == "full" else _SYSTEM_PROMPT_COMPACT,
         "state": state_block,
         "identity": identity_block,
         "retrieval": "\n".join(retrieval_lines),
@@ -353,6 +553,7 @@ def hybrid_retrieve(conn, query_text: str, query_embedding: List[float],
                     top_k: Optional[int] = None,
                     per_retriever_k: Optional[int] = None,
                     after_rrf_k: Optional[int] = None,
+                    query_kind: Optional[str] = None,
                     ) -> Tuple[List[Episode], Dict[str, int]]:
     """Cast four candidate sources, RRF-fuse, optional cross-encoder rerank,
     then apply the state-modulated tilt.
@@ -412,5 +613,8 @@ def hybrid_retrieve(conn, query_text: str, query_embedding: List[float],
 
     # ----- Final state-modulated R(m) tilt + isolation assert -------------
     final = rerank(fused, state, top_k=top_k)
+    if config.RECALL_POLICY == "adaptive":
+        final = select_sparse_recall(
+            final, state, query_kind or classify_query(query_text), query_text)
     _rerank.assert_user_isolation(final, user_id)
     return final, stats

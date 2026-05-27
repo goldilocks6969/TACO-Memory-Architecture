@@ -23,12 +23,12 @@ from typing import Dict, List, Optional
 
 import psycopg
 
-from . import config, embeddings, llm
+from . import config, embeddings, llm, state_estimator
 from .memory import (decay, extract, identity, operations, reconsolidation,
                      retrieval, salience, store)
 from .memory.episode import Episode
 from .retry import CallTimeout
-from .state import ContentSignal, LatentState, infer_state
+from .state import LatentState
 from .subsystems import orchestrator, prediction
 from .subsystems.orchestrator import CognitivePlan
 from .subsystems.prediction import PredictiveContinuity
@@ -130,9 +130,9 @@ class Taco:
 
         # 2. infer the new latent state S
         gap = self._hours_since_last() if hours_since_last is None else hours_since_last
-        signal = ContentSignal(emotional=light.emotional,
-                               vulnerability=light.vulnerability)
-        self.state = infer_state(self.state, signal, gap)
+        state_read = state_estimator.estimate_state(
+            user_message, self.state, gap, light=light)
+        self.state = state_read.state
 
         # 3. orchestrator resolves all six subsystems + the reasoning stance from S
         plan = orchestrator.plan(self.state)
@@ -148,6 +148,7 @@ class Taco:
 
         # 5. retrieval. Episodes still feed L7 reconsolidation (they are the raw
         #    affective record); FACTS are the retrieval target for the briefing.
+        query_kind = retrieval.classify_query(user_message)
         q_emb = embeddings.embed_list(user_message)
         epi_cands = store.knn_candidates(self.conn, q_emb, config.CANDIDATE_CAST,
                                          user_id=self.user_id)
@@ -170,7 +171,7 @@ class Taco:
         if config.RETRIEVAL_MODE == "hybrid":
             top, hstats = retrieval.hybrid_retrieve(
                 self.conn, user_message, q_emb, self.state,
-                user_id=self.user_id)
+                user_id=self.user_id, query_kind=query_kind)
             self._account_retrieval(hstats)
         else:
             fact_cands = store.fact_knn_candidates(
@@ -184,6 +185,8 @@ class Taco:
                     if c.id not in seen:
                         fact_cands.append(c)
             top = retrieval.rerank(fact_cands, self.state, top_k=config.TOP_K)
+            top = retrieval.select_sparse_recall(
+                top, self.state, query_kind, user_message)
         top = self._surface_threads(top)  # open threads always included (Phase 1.6)
 
         beliefs = store.belief_candidates(self.conn, q_emb, k=2,
@@ -218,13 +221,16 @@ class Taco:
             store.add_emotional(self.conn, ep_id, self.state.E,
                                 analysis.get("tone"), analysis["salience"],
                                 user_id=self.user_id)
-            # L10: consolidate identity from significant moments only.
-            identity_updates = identity.consolidate(
-                self.conn, user_message, analysis["salience"], self.state,
-                llm.extract_identity, user_id=self.user_id)
+            # L10: consolidate identity from significant moments only. Eval
+            # ingest can skip this live LLM call; product turns keep it.
+            if generate_response or not config.SKIP_IDENTITY_DURING_INGEST:
+                identity_updates = identity.consolidate(
+                    self.conn, user_message, analysis["salience"], self.state,
+                    llm.extract_identity, user_id=self.user_id)
 
         # 9b. extract + reconcile structured facts (ADD/UPDATE/MERGE/DELETE/NOOP).
-        if light.salience >= self.state.theta_facts():
+        if (light.salience >= self.state.theta_facts()
+                or extract.has_memory_anchor(user_message, light)):
             self._write_facts(user_message, light, ep_id)
 
         # 10. write-back: working memory + persisted state.  The assistant
@@ -264,6 +270,26 @@ class Taco:
         print("[extract] light fact created", flush=True)
         return fid
 
+    def _store_light_facts(self, user_message: str,
+                           light: "extract.LightExtract",
+                           source_episode_id: Optional[int]) -> List[int]:
+        """Synthesize one or more deterministic facts (no LLM).
+
+        The broad light fact preserves the event; anchor facts preserve concrete
+        continuity handles like names, outcomes, progress markers, and open
+        threads. This is the cheap write-time formation layer used by LIGHT mode.
+        """
+        ids: List[int] = []
+        for fact in extract.light_facts(user_message, light):
+            f_emb = embeddings.embed_list(fact.summary)
+            fid = store.add_fact(self.conn, fact, f_emb, source_episode_id,
+                                 self.state, user_id=self.user_id)
+            ids.append(fid)
+            self.extraction_stats["light_facts_created"] += 1
+        if ids:
+            print(f"[extract] {len(ids)} light fact(s) created", flush=True)
+        return ids
+
     def _apply_full_facts(self, full: "extract.FullExtract",
                           source_episode_id: Optional[int]) -> None:
         """Run the rich facts through dedup (``decide_action``) + ``apply``.
@@ -293,15 +319,16 @@ class Taco:
         mode = config.EXTRACTION_MODE
 
         if mode == "light":
-            # One light fact, period. No full_extract, no decide_action — the
-            # cheap, hang-free write path the first real benchmark uses.
-            self._store_light_fact(user_message, light, source_episode_id)
+            # Deterministic light/anchor facts, no full_extract, no
+            # decide_action — the cheap, hang-free write path the live
+            # benchmark and BYO-key product path can rely on.
+            self._store_light_facts(user_message, light, source_episode_id)
             return
 
         if mode == "auto":
             # Light fact first so we never have *no* fact, even if the
             # subsequent rich extraction times out.
-            self._store_light_fact(user_message, light, source_episode_id)
+            self._store_light_facts(user_message, light, source_episode_id)
             if (light.salience < config.AUTO_FULL_MIN_SALIENCE
                     or len(user_message) >= config.AUTO_FULL_MAX_CHARS):
                 return  # not worth the rich-extract spend / hang risk
@@ -387,17 +414,20 @@ class Taco:
             history, store.recent_salient_episodes(self.conn, user_id=self.user_id))
 
         q_emb = embeddings.embed_list(user_message)
+        query_kind = retrieval.classify_query(user_message)
         if config.RETRIEVAL_MODE == "hybrid":
             top, hstats = retrieval.hybrid_retrieve(
                 self.conn, user_message, q_emb, state,
-                user_id=self.user_id)
+                user_id=self.user_id, query_kind=query_kind)
             self._account_retrieval(hstats)
             top = self._surface_threads(top)
         else:
             fact_cands = store.fact_knn_candidates(
                 self.conn, q_emb, config.CANDIDATE_CAST, user_id=self.user_id)
-            top = self._surface_threads(retrieval.rerank(
-                fact_cands, state, top_k=config.TOP_K))
+            top = retrieval.rerank(fact_cands, state, top_k=config.TOP_K)
+            top = retrieval.select_sparse_recall(
+                top, state, query_kind, user_message)
+            top = self._surface_threads(top)
         beliefs = store.belief_candidates(self.conn, q_emb, k=2,
                                           user_id=self.user_id)
         identity_lines = identity.snapshot_lines(self.conn, user_id=self.user_id)

@@ -4,10 +4,11 @@ These validate the decay *math* (vitality = weekly_decay ** weeks) and the
 abstraction threshold without touching the database.
 """
 from taco import config
+from taco.memory import decay
 
 
 def vitality(weekly_decay: float, weeks: float) -> float:
-    return weekly_decay ** weeks
+    return decay.vitality_after_weeks(weekly_decay, weeks)
 
 
 def test_high_salience_is_near_permanent():
@@ -37,3 +38,9 @@ def test_decay_is_monotonic_and_ordered_by_tier():
 
 def test_abstraction_threshold_value():
     assert config.ABSTRACTION_THRESHOLD == 0.15
+
+
+def test_crosses_abstraction_threshold_helper():
+    rate = config.tier_for_score(3).weekly_decay
+    assert decay.crosses_abstraction_threshold(rate, 1) is False
+    assert decay.crosses_abstraction_threshold(rate, 10) is True

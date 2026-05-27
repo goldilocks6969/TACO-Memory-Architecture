@@ -71,10 +71,20 @@ def test_compact_mode_under_80_tokens(hot_inputs):
     )
     # the tone + stance must still be present — they carry the actual signal
     assert "tone=" in s["state"]
-    assert "Stance" in s["state"]
+    assert "stance=" in s["state"]
+    assert "psychologically privileged" not in s["state"].lower()
     # compact drops working memory and prediction by design
     assert not s["working"]
     assert not s["prediction"]
+
+
+def test_compact_mode_is_genuinely_tiny(hot_inputs):
+    """The practical eval target is much lower than the hard 80-token cap."""
+    s = briefing_sections([], hot_inputs["beliefs"], hot_inputs["working"],
+                          hot_inputs["state"], hot_inputs["stance"],
+                          identity=hot_inputs["identity"], mode="compact")
+    assert _state_briefing_tokens(s) <= 35
+    assert _count_tokens(s["system"]) < 20
 
 
 def test_minimal_mode_under_35_tokens(hot_inputs):
@@ -95,9 +105,9 @@ def test_minimal_mode_under_35_tokens(hot_inputs):
     assert not s["prediction"]
 
 
-def test_retrieval_payload_unaffected_by_mode(hot_inputs):
-    """The retrieved memory/fact payload is charged separately — changing the
-    state-briefing mode must not change ``retrieval``."""
+def test_retrieval_payload_is_present_in_every_mode(hot_inputs):
+    """Compact/minimal may render retrieval tersely, but they must preserve the
+    retrieved content signal."""
     full = briefing_sections([], hot_inputs["beliefs"], hot_inputs["working"],
                              hot_inputs["state"], hot_inputs["stance"],
                              identity=hot_inputs["identity"], mode="full")
@@ -107,7 +117,10 @@ def test_retrieval_payload_unaffected_by_mode(hot_inputs):
     minimal = briefing_sections([], hot_inputs["beliefs"], hot_inputs["working"],
                                  hot_inputs["state"], hot_inputs["stance"],
                                  identity=hot_inputs["identity"], mode="minimal")
-    assert full["retrieval"] == compact["retrieval"] == minimal["retrieval"]
+    assert "grief" in full["retrieval"]
+    assert "grief" in compact["retrieval"]
+    assert "grief" in minimal["retrieval"]
+    assert _count_tokens(compact["retrieval"]) < _count_tokens(full["retrieval"])
 
 
 def test_mode_reads_from_config_by_default(hot_inputs, monkeypatch):

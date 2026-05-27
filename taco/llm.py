@@ -206,7 +206,7 @@ def respond(system_brief: str, user_message: str, planning_depth: int) -> str:
         temperature=temperature,
         max_tokens=config.RESPONSE_MAX_TOKENS,
         timeout=config.LLM_REQUEST_TIMEOUT_S,
-    ), label="llm.respond")
+    ), label="llm.respond", timeout_per_attempt=config.LLM_REQUEST_TIMEOUT_S)
     return resp.choices[0].message.content.strip()
 
 
@@ -223,7 +223,7 @@ def _top_memory(system_brief: str) -> str:
     """
     in_block = False
     for line in system_brief.splitlines():
-        if line.startswith("Psychologically privileged memories"):
+        if line.startswith("Psychologically privileged memories") or line.strip() == "M:":
             in_block = True
             continue
         if in_block:
@@ -231,6 +231,8 @@ def _top_memory(system_brief: str) -> str:
             if stripped.startswith("•"):
                 # strip the "• [tone, salience N/10, R=x] " metadata prefix
                 return re.sub(r"^•\s*\[[^\]]*\]\s*", "", stripped).strip()
+            if stripped.startswith("-"):
+                return re.sub(r"^-\s*", "", stripped).strip()
             if stripped == "":
                 break
     return ""

@@ -25,6 +25,17 @@ class DecayReport:
     beliefs: List[str]
 
 
+def vitality_after_weeks(weekly_decay: float, weeks: float) -> float:
+    """Return the remaining vitality for a tier after ``weeks``."""
+    return weekly_decay ** weeks
+
+
+def crosses_abstraction_threshold(weekly_decay: float, weeks: float,
+                                  threshold: float = config.ABSTRACTION_THRESHOLD) -> bool:
+    """Whether a memory should be abstracted before pruning at this age."""
+    return vitality_after_weeks(weekly_decay, weeks) < threshold
+
+
 def recompute_vitality(conn: psycopg.Connection, extra_weeks: float = 0.0,
                        user_id: str = _store.DEFAULT_USER_ID) -> int:
     """Recompute vitality = weekly_decay ^ age_weeks for this user's live episodes.

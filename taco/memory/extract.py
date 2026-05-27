@@ -60,10 +60,14 @@ _CUE_MAP = (
     (("divorce",), "the divorce"),
     (("laid off", "fired", "let go", "lost my job"), "losing the job"),
     (("interview",), "interview anxiety"),
-    (("diagnos", "cancer", "metformin", "diabetes"), "the health diagnosis"),
+    (("got the job", "hired", "better pay", "raise"), "career outcome"),
+    (("diagnos", "cancer", "metformin", "diabetes", "a1c"), "the health diagnosis"),
+    (("dropped", "progress", "small win"), "progress update"),
     (("relapse", "sober", "quit drinking", "recovery"), "the recovery struggle"),
     (("fraud", "imposter", "not good enough", "failing"), "feeling not good enough"),
     (("promotion", "got the job", "raise"), "the career win"),
+    (("called me", "nickname"), "personal nickname"),
+    (("reached out", "wants to talk"), "unresolved relationship thread"),
 )
 
 _EVENT_KEYWORDS = (
@@ -119,6 +123,21 @@ def _heuristic_cues(text: str, limit: int) -> List[str]:
         if len(cues) >= limit:
             break
     return cues[:limit]
+
+
+def _dedupe(items: List[str], limit: int) -> List[str]:
+    seen, out = set(), []
+    for item in items:
+        if not item:
+            continue
+        key = item.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item.strip())
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _heuristic_event_type(text: str) -> str:
@@ -209,6 +228,199 @@ def light_fact(text: str, light: LightExtract,
         due_date=None,
         confidence=0.6,
     )
+
+
+def _anchor_fact(summary: str, light: LightExtract, *,
+                 fact_type: str = "event", event_type: str = "event",
+                 cues: Optional[List[str]] = None,
+                 entities: Optional[List[str]] = None,
+                 salience_floor: float = 4.0,
+                 thread_status: Optional[str] = None) -> Fact:
+    """Build a durable anchor fact from a deterministic pattern.
+
+    Anchor facts are not a replacement for salience; they are the informational
+    half of write-time salience. A nickname, outcome, medication, date, or
+    progress marker may be emotionally quiet in isolation, but it is exactly the
+    kind of continuity anchor a state-aware memory layer should preserve when it
+    appears inside an ongoing high-salience thread.
+    """
+    merged_cues = _dedupe(list(cues or []) + list(light.retrieval_cues or []), 3)
+    merged_entities = _dedupe(list(entities or []) + list(light.entities or []), 6)
+    return Fact(
+        summary=_condense(summary),
+        fact_type=fact_type,
+        event_type=event_type,
+        emotional_tone=light.tone,
+        salience=max(light.salience, salience_floor),
+        retrieval_cues=merged_cues,
+        entity_keys=merged_entities,
+        validity="current",
+        thread_status=thread_status,
+        confidence=0.7,
+    )
+
+
+def anchor_facts(text: str, light: LightExtract) -> List[Fact]:
+    """Extract cheap durable anchors from one turn.
+
+    This is the production-oriented middle tier between raw light facts and an
+    LLM-backed full extraction pass. It keeps the write path hang-free while
+    preserving the concrete details that long-horizon continuity depends on.
+    """
+    s = " ".join(text.strip().split())
+    t = s.lower()
+    facts: List[Fact] = []
+
+    # Personal names / nicknames: "he always called me 'kiddo'".
+    for m in re.finditer(r"\b(?:called me|calls me|used to call me)\s+['\"]?([^'\".,!?]+)['\"]?", s, re.I):
+        nick = m.group(1).strip()
+        if nick:
+            facts.append(_anchor_fact(
+                f"The user was called '{nick}' by someone important to them.",
+                light,
+                fact_type="relationship",
+                event_type="identity",
+                cues=["nickname", "what they were called", nick],
+                salience_floor=6.5,
+            ))
+
+    # Relationship updates: "Sam reached out. wants to 'talk'."
+    if "reached out" in t and ("talk" in t or "call" in t or "meet" in t):
+        facts.append(_anchor_fact(
+            s,
+            light,
+            fact_type="thread",
+            event_type="relationship",
+            cues=["unresolved relationship thread", "reached out", "wants to talk"],
+            salience_floor=6.5,
+            thread_status="unresolved",
+        ))
+
+    # Career outcomes supersede prior interview/job-loss uncertainty.
+    if re.search(r"\b(got the job|hired|accepted an offer)\b", t):
+        org = None
+        m = re.search(r"\b(?:at|with)\s+([A-Z][A-Za-z0-9&.-]+)", s)
+        if m:
+            org = m.group(1)
+        summary = f"The user got hired{f' at {org}' if org else ''}."
+        if "better pay" in t or "raise" in t:
+            summary += " The role improves their pay."
+        entities = [f"org:{org.lower()}"] if org else []
+        facts.append(_anchor_fact(
+            summary,
+            light,
+            fact_type="event",
+            event_type="achievement",
+            cues=["career outcome", "new job", "hired", org or ""],
+            entities=entities,
+            salience_floor=7.5,
+        ))
+
+    # Health progress markers: "my A1C dropped..." should answer progress probes.
+    if "a1c" in t and any(k in t for k in ("dropped", "down", "lower", "improved", "better")):
+        facts.append(_anchor_fact(
+            "The user's A1C dropped at a recheck, indicating health progress.",
+            light,
+            fact_type="event",
+            event_type="health",
+            cues=["health progress", "A1C improved", "diabetes progress"],
+            salience_floor=7.0,
+        ))
+
+    # Baby/name/gender anchors.
+    m = re.search(r"\b(?:naming|name)\s+(?:her|him|the baby)\s+([A-Z][a-z]+)", s)
+    if not m:
+        m = re.search(r"\bthinking of naming (?:her|him|the baby)\s+([A-Z][a-z]+)", s)
+    if m:
+        name = m.group(1)
+        facts.append(_anchor_fact(
+            f"The user is considering the baby name {name}.",
+            light,
+            fact_type="state",
+            event_type="identity",
+            cues=["baby name", "name considered", name],
+            entities=[f"person:{name.lower()}"],
+            salience_floor=7.0,
+        ))
+    if "it's a girl" in t or "it is a girl" in t:
+        facts.append(_anchor_fact(
+            "The user is expecting a girl.",
+            light,
+            fact_type="state",
+            event_type="identity",
+            cues=["baby gender", "girl", "expecting"],
+            salience_floor=6.5,
+        ))
+
+    # Relocation / housing settledness.
+    if "found an apartment" in t:
+        place = None
+        m = re.search(r"\bin\s+([A-Z][A-Za-z]+)", s)
+        if m:
+            place = m.group(1)
+        facts.append(_anchor_fact(
+            f"The user found an apartment{f' in {place}' if place else ''}.",
+            light,
+            fact_type="event",
+            event_type="plan",
+            cues=["housing settled", "found apartment", place or ""],
+            entities=[f"place:{place.lower()}"] if place else [],
+            salience_floor=6.5,
+        ))
+
+    # Academic recovery / grade outcomes.
+    m = re.search(r"\bgot (?:a |an )?([A-F][+-]?)\b.*\b(midterm|exam|test|class)\b", s, re.I)
+    if not m:
+        m = re.search(r"\b([A-F][+-]?)\b.*\b(midterm|exam|test|class)\b", s, re.I)
+    if m and any(k in t for k in ("got", "understand", "midterm", "exam")):
+        grade = m.group(1).upper()
+        facts.append(_anchor_fact(
+            f"The user got a {grade} on the recent academic assessment.",
+            light,
+            fact_type="event",
+            event_type="achievement",
+            cues=["grade update", "academic progress", grade],
+            salience_floor=6.5,
+        ))
+
+    return facts
+
+
+def light_facts(text: str, light: LightExtract) -> List[Fact]:
+    """Return deterministic facts for LIGHT mode.
+
+    The first fact is the broad event summary. Anchor facts add structured
+    retrieval handles for continuity-critical details. De-dup by summary so a
+    simple turn still stores exactly one fact.
+    """
+    facts = [light_fact(text, light)]
+    facts.extend(anchor_facts(text, light))
+    out: List[Fact] = []
+    by_summary: Dict[str, Fact] = {}
+    for f in facts:
+        key = f.summary.lower()
+        existing = by_summary.get(key)
+        if existing is not None:
+            existing.salience = max(existing.salience, f.salience)
+            existing.retrieval_cues = _dedupe(
+                existing.retrieval_cues + f.retrieval_cues, 3)
+            existing.entity_keys = _dedupe(
+                existing.entity_keys + f.entity_keys, 6)
+            if f.fact_type and existing.fact_type == "event":
+                existing.fact_type = f.fact_type
+            if f.event_type and existing.event_type == "event":
+                existing.event_type = f.event_type
+            if f.thread_status:
+                existing.thread_status = f.thread_status
+            continue
+        by_summary[key] = f
+        out.append(f)
+    return out
+
+
+def has_memory_anchor(text: str, light: LightExtract) -> bool:
+    """Whether a low-arousal turn still carries a durable continuity anchor."""
+    return bool(anchor_facts(text, light))
 
 
 # --------------------------------------------------------------------------- #

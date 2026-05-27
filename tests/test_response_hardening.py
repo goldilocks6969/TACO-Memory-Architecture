@@ -60,6 +60,23 @@ def test_respond_passes_max_tokens_and_sdk_timeout(monkeypatch):
     assert kwargs["timeout"] == 30.0
 
 
+def test_respond_passes_outer_thread_timeout(monkeypatch):
+    """The SDK timeout is not enough: the retry wrapper's daemon-thread timeout
+    must use the same budget, otherwise wedged sockets linger until the global
+    default."""
+    _install_fake_client(monkeypatch)
+    monkeypatch.setattr(config, "LLM_REQUEST_TIMEOUT_S", 17.0)
+    seen = {}
+
+    def _spy(fn, **kwargs):
+        seen.update(kwargs)
+        return fn()
+
+    monkeypatch.setattr(llm, "with_retries", _spy)
+    llm.respond("brief", "user message", planning_depth=1)
+    assert seen["timeout_per_attempt"] == 17.0
+
+
 def test_respond_uses_response_model(monkeypatch):
     """``respond`` must hit ``config.RESPONSE_MODEL`` — the dedicated answer
     model — not the extraction model."""
@@ -125,6 +142,25 @@ def test_judge_uses_judge_model_and_max_tokens(monkeypatch):
     assert kwargs["model"] == "model-for-judging"
     assert kwargs["max_tokens"] == 120
     assert kwargs["timeout"] == 25.0
+
+
+def test_judge_passes_outer_thread_timeout(monkeypatch):
+    """Judge calls also need the outer timeout budget so benchmark timeout rows
+    are produced promptly."""
+    _install_fake_client(monkeypatch, content='{"score": 90, "reason": "ok"}')
+    monkeypatch.setattr(config, "LLM_REQUEST_TIMEOUT_S", 19.0)
+    import taco.retry as retry
+    seen = {}
+    real = retry.with_retries
+
+    def _spy(fn, **kwargs):
+        seen.update(kwargs)
+        return real(fn, **kwargs)
+
+    monkeypatch.setattr(retry, "with_retries", _spy)
+    out = judge.judge("probe", "ground truth", "factual", "response")
+    assert out["score"] == 90
+    assert seen["timeout_per_attempt"] == 19.0
 
 
 # --------------------------------------------------------------------------- #
