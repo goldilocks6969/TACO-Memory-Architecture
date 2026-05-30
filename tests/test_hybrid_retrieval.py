@@ -180,6 +180,156 @@ def test_filler_suppressed_by_state_tilt(conn):
     assert "mother died" in top[0].content.lower()
 
 
+def test_origin_retrieval_prefers_earliest_arc_boundary(conn):
+    """Origin-aware retrieval should recover the beginning of an arc, not only
+    the most recent or highest-salience trace."""
+    early = Fact(
+        summary="Trace [work_career / avoidance / origin / 2024-10-15]: User ignored workplace harassment at first.",
+        fact_type="trace",
+        event_type="work_career",
+        salience=7,
+        retrieval_cues=["work career arc", "origin of work career", "initial response"],
+        entity_keys=[
+            "arc:work_career", "role:avoidance", "phase:origin",
+            "label:conflict_marker", "time:2024-10-15",
+        ],
+    )
+    late = Fact(
+        summary="Trace [work_career / escalation / transition / 2025-10-28]: Work tension escalated much later.",
+        fact_type="trace",
+        event_type="work_career",
+        salience=9,
+        retrieval_cues=["work career arc", "conflict or contradiction"],
+        entity_keys=[
+            "arc:work_career", "role:escalation", "phase:transition",
+            "label:conflict_marker", "time:2025-10-28",
+        ],
+    )
+    _ingest_fact(conn, user_id="origin_user", fact=late, anchor="late work tension")
+    _ingest_fact(conn, user_id="origin_user", fact=early, anchor="early harassment")
+
+    top, stats = _hybrid(
+        conn,
+        "did I address the harassment issue when it first started?",
+        user_id="origin_user",
+    )
+    assert stats["candidates_origin"] >= 1
+    assert "ignored workplace harassment at first" in top[0].content
+
+
+def test_trajectory_retrieval_returns_causal_chain(conn):
+    """Trajectory retrieval should assemble origin, cause, and coping traces
+    for sequence/evolution questions."""
+    origin = Fact(
+        summary="Trace [work_career / avoidance / origin / 2024-10-15]: User avoided addressing workplace harassment.",
+        fact_type="trace",
+        event_type="work_career",
+        salience=7,
+        retrieval_cues=["work career arc", "origin of work career"],
+        entity_keys=[
+            "arc:work_career", "role:avoidance", "phase:origin",
+            "cause:workplace_conflict", "rel:caused_by",
+            "label:conflict_marker", "time:2024-10-15",
+        ],
+    )
+    stressor = Fact(
+        summary="Trace [work_career / escalation / transition / 2024-10-25]: Work harassment made the user feel powerless.",
+        fact_type="trace",
+        event_type="work_career",
+        salience=8,
+        retrieval_cues=["workplace conflict", "causal antecedent"],
+        entity_keys=[
+            "arc:work_career", "role:escalation", "phase:transition",
+            "cause:workplace_conflict", "rel:caused_by", "rel:same_arc_as",
+            "label:conflict_marker", "time:2024-10-25",
+        ],
+    )
+    coping = Fact(
+        summary="Trace [mental_health_coping / attempted_action / transition / 2024-11-05]: Therapy helped the user set boundaries around work stress.",
+        fact_type="trace",
+        event_type="mental_health_coping",
+        salience=8,
+        retrieval_cues=["therapy", "triggered coping"],
+        entity_keys=[
+            "arc:mental_health_coping", "role:attempted_action",
+            "phase:transition", "coping:therapy", "coping:boundary_setting",
+            "cause:workplace_conflict", "rel:triggered_coping",
+            "rel:coping_response", "time:2024-11-05",
+        ],
+    )
+    distractor = Fact(
+        summary="Trace [mental_health_coping / onset / origin / 2025-10-28]: The user started a painting class much later.",
+        fact_type="trace",
+        event_type="mental_health_coping",
+        salience=9,
+        retrieval_cues=["painting", "coping"],
+        entity_keys=[
+            "arc:mental_health_coping", "role:onset", "phase:origin",
+            "coping:creative_expression", "rel:coping_response",
+            "time:2025-10-28",
+        ],
+    )
+    _ingest_fact(conn, user_id="trajectory_user", fact=distractor,
+                 anchor="later painting class")
+    _ingest_fact(conn, user_id="trajectory_user", fact=origin,
+                 anchor="early work harassment")
+    _ingest_fact(conn, user_id="trajectory_user", fact=stressor,
+                 anchor="work harassment powerless")
+    _ingest_fact(conn, user_id="trajectory_user", fact=coping,
+                 anchor="therapy boundaries work stress")
+
+    top, stats = _hybrid(
+        conn,
+        "what was the sequence of events that led me to start therapy?",
+        user_id="trajectory_user",
+    )
+    contents = "\n".join(ep.content for ep in top)
+    assert stats["candidates_trajectory"] >= 3
+    assert "avoided addressing workplace harassment" in contents
+    assert "made the user feel powerless" in contents
+    assert "Therapy helped the user set boundaries" in contents
+
+
+def test_trajectory_retrieval_prefers_bridge_fact(conn):
+    bridge = Fact(
+        summary="Bridge [mental_health_coping / triggered_coping / 2024-11-05]: The user's therapy emerged as a coping response after workplace conflict and relationship loss.",
+        fact_type="bridge",
+        event_type="mental_health_coping",
+        salience=8,
+        retrieval_cues=["causal bridge", "what led to coping", "therapy"],
+        entity_keys=[
+            "arc:mental_health_coping", "role:attempted_action",
+            "phase:transition", "rel:caused_by", "rel:triggered_coping",
+            "rel:coping_response", "cause:workplace_conflict",
+            "cause:relationship_loss", "coping:therapy", "time:2024-11-05",
+        ],
+    )
+    support = Fact(
+        summary="Trace [mental_health_coping / onset / origin / 2025-01-05]: Therapy has been helpful later.",
+        fact_type="trace",
+        event_type="mental_health_coping",
+        salience=9,
+        retrieval_cues=["therapy", "coping"],
+        entity_keys=[
+            "arc:mental_health_coping", "role:onset", "phase:origin",
+            "coping:therapy", "rel:coping_response", "time:2025-01-05",
+        ],
+    )
+    _ingest_fact(conn, user_id="bridge_user", fact=support,
+                 anchor="therapy helpful later")
+    _ingest_fact(conn, user_id="bridge_user", fact=bridge,
+                 anchor="therapy because workplace conflict relationship loss")
+
+    top, stats = _hybrid(
+        conn,
+        "what was the sequence of events that led me to start therapy?",
+        user_id="bridge_user",
+    )
+    assert stats["candidates_trajectory"] >= 1
+    assert top[0].fact_type == "bridge"
+    assert "workplace conflict and relationship loss" in top[0].content
+
+
 # --------------------------------------------------------------------------- #
 # (e) scenario isolation (regression for the earlier cross-scenario leak)
 # --------------------------------------------------------------------------- #

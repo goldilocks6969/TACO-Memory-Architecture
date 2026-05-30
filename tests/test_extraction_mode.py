@@ -132,6 +132,35 @@ def test_light_mode_creates_facts_from_salient_messages(conn, monkeypatch):
     assert taco.extraction_stats["light_facts_created"] >= 3
 
 
+def test_light_mode_synthesizes_causal_bridge(conn, monkeypatch):
+    monkeypatch.setattr(config, "EXTRACTION_MODE", "light")
+    monkeypatch.setattr(config, "SKIP_IDENTITY_DURING_INGEST", True)
+
+    taco = Taco(conn, user_id="bridge_ingest")
+    taco.turn(
+        "[2024-10-15 session p1 turn 5] There's been constant workplace harassment, but I haven’t addressed it.",
+        hours_since_last=0.5,
+        generate_response=False,
+    )
+    taco.turn(
+        "[2024-11-05 session p1 turn 21] Therapy has been grounding and helped me set boundaries around work stress.",
+        hours_since_last=24,
+        generate_response=False,
+    )
+
+    rows = conn.execute(
+        "SELECT summary, entity_keys FROM facts "
+        "WHERE user_id = %s AND fact_type = 'bridge'",
+        ("bridge_ingest",),
+    ).fetchall()
+    assert rows
+    summary, keys = rows[0]
+    assert "workplace harassment" in summary
+    assert "therapy" in summary
+    assert "rel:triggered_coping" in keys
+    assert taco.extraction_stats["bridge_facts_created"] >= 1
+
+
 def test_light_mode_skips_trivial_low_salience(conn, monkeypatch):
     """The salience gate in Taco.turn protects the fact store from chatter."""
     monkeypatch.setattr(config, "EXTRACTION_MODE", "light")

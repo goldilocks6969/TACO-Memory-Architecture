@@ -96,6 +96,27 @@ _COHERENCE_RE = re.compile(
     r"fully over|making any|where am i|right now|at this point|headway)\b",
     re.I,
 )
+_TEMPORAL_RE = re.compile(
+    r"\b(before|after|first|initially|at first|eventually|later|timeline|"
+    r"sequence|led to|lead to|over time|changed from|started|began|when)\b",
+    re.I,
+)
+_CONFLICT_RE = re.compile(
+    r"\b(conflict|harassment|address|addressed|contradict|contradiction|"
+    r"inconsistent|outdated|changed|remain stable|still true|initially address|address at first|"
+    r"did .* change|no longer|used to)\b",
+    re.I,
+)
+_USER_MODELING_RE = re.compile(
+    r"\b(how has|how did .* evolve|coping|cope|approach|pattern|tendency|"
+    r"what does .* say about|user model|changed emotionally|state evolved)\b",
+    re.I,
+)
+_ORIGIN_RE = re.compile(
+    r"\b(first|initially|at first|when it started|when .* started|beginning|"
+    r"began|origin|led to|lead to|sequence of events|what led)\b",
+    re.I,
+)
 _EMOTIONAL_RE = re.compile(
     r"\b(why|what's going on|unpack|thoughts|feeling|felt|feel|lost it|"
     r"alienated|stomach dropped|surge of anger|welled up|pull over|sick)\b",
@@ -120,6 +141,12 @@ def classify_query(query: str) -> str:
         return "general"
     if _FILLER_RE.search(q):
         return "filler"
+    if _CONFLICT_RE.search(q):
+        return "conflict"
+    if _USER_MODELING_RE.search(q):
+        return "user_modeling"
+    if _TEMPORAL_RE.search(q):
+        return "temporal"
     if _EMOTIONAL_RE.search(q):
         return "emotional"
     if _COHERENCE_RE.search(q):
@@ -136,9 +163,85 @@ def recall_budget(query_kind: str) -> int:
         "factual": config.RECALL_FACTUAL_K,
         "emotional": config.RECALL_EMOTIONAL_K,
         "coherence": config.RECALL_COHERENCE_K,
+        "temporal": max(config.RECALL_COHERENCE_K, config.RECALL_FACTUAL_K + 2),
+        "conflict": max(config.RECALL_COHERENCE_K, config.RECALL_FACTUAL_K + 2),
+        "user_modeling": max(config.RECALL_COHERENCE_K, config.RECALL_EMOTIONAL_K),
         "filler": config.RECALL_FILLER_K,
         "general": config.RECALL_GENERAL_K,
     }.get(query_kind, config.RECALL_GENERAL_K)
+
+
+def _arc_query_entity_keys(query_text: str, query_kind: str) -> List[str]:
+    """Synthetic query keys for capability-aware retrieval.
+
+    These are broad product-domain keys, not scenario-specific keywords. They
+    let the existing entity-overlap retriever find lifecycle traces when the
+    question asks about time, conflict, or user-state evolution.
+    """
+    q = (query_text or "").lower()
+    keys: List[str] = []
+    arc_terms = (
+        ("arc:work_career", ("work", "job", "career", "boss", "manager", "harassment")),
+        ("arc:relationships", ("relationship", "partner", "dating", "breakup", "friend")),
+        ("arc:family", ("family", "mother", "mom", "father", "dad", "child")),
+        ("arc:health_safety", ("health", "doctor", "diagnosis", "medication", "safety")),
+        ("arc:mental_health_coping", ("coping", "cope", "therapy", "therapist", "stress")),
+        ("arc:identity_values", ("identity", "values", "preference", "belief")),
+        ("arc:life_transition", ("moving", "moved", "relocation", "pregnancy", "transition")),
+        ("arc:education_growth", ("school", "class", "exam", "grade", "teacher")),
+        ("arc:finance_security", ("money", "finance", "rent", "salary", "debt")),
+        ("arc:legal_admin", ("legal", "court", "lawyer", "hr", "complaint")),
+    )
+    for key, terms in arc_terms:
+        if any(term in q for term in terms):
+            keys.append(key)
+    if query_kind == "temporal" and any(
+        term in q for term in ("therapy", "therapist", "coping", "stress", "mental health")
+    ):
+        keys.extend([
+            "arc:mental_health_coping",
+            "arc:work_career",
+            "arc:relationships",
+            "arc:family",
+            "arc:health_safety",
+        ])
+    if query_kind == "temporal":
+        keys.extend(["label:temporal_event", "role:onset", "role:outcome"])
+    elif query_kind == "conflict":
+        keys.extend(["label:conflict_marker", "role:avoidance", "role:resolution"])
+    elif query_kind == "user_modeling":
+        keys.extend(["label:coping_strategy", "label:state_change", "role:state_change"])
+    if is_origin_query(query_text):
+        keys.extend(["phase:origin", "role:onset", "role:avoidance"])
+    seen, out = set(), []
+    for key in keys:
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out[:8]
+
+
+def _query_arc_keys(query_text: str, query_kind: str) -> List[str]:
+    return [
+        key for key in _arc_query_entity_keys(query_text, query_kind)
+        if key.startswith("arc:")
+    ]
+
+
+def is_origin_query(query_text: str) -> bool:
+    return bool(_ORIGIN_RE.search(query_text or ""))
+
+
+def is_trajectory_query(query_text: str, query_kind: str) -> bool:
+    q = query_text or ""
+    if query_kind in {"temporal", "user_modeling"}:
+        return True
+    return bool(re.search(
+        r"\b(evolved|evolution|progression|trajectory|sequence|led to|lead to|"
+        r"over time|from .* to|how has|what changed)\b",
+        q,
+        re.I,
+    ))
 
 
 def _norm_words(text: str) -> set:
@@ -200,6 +303,22 @@ def _query_overlap(ep: Episode, query_text: str) -> float:
     return len(q & mem) / max(1, len(q))
 
 
+def _has_entity_prefix(ep: Episode, prefix: str) -> bool:
+    return any(
+        str(key).startswith(prefix)
+        for key in (getattr(ep, "entity_keys", []) or [])
+    )
+
+
+def _has_entity_key(ep: Episode, key: str) -> bool:
+    return key in (getattr(ep, "entity_keys", []) or [])
+
+
+def _has_any_entity_key(ep: Episode, keys: List[str]) -> bool:
+    ep_keys = set(getattr(ep, "entity_keys", []) or [])
+    return any(key in ep_keys for key in keys)
+
+
 def _boost_for_kind(ep: Episode, query_kind: str, state: LatentState,
                     query_text: str = "") -> float:
     ft = getattr(ep, "fact_type", None)
@@ -221,6 +340,55 @@ def _boost_for_kind(ep: Episode, query_kind: str, state: LatentState,
             boost += 0.10
         if et in ("achievement", "health", "plan", "relationship"):
             boost += 0.08
+    elif query_kind in ("temporal", "conflict", "user_modeling"):
+        boost += _query_overlap(ep, query_text) * 0.12
+        if ft == "trace":
+            boost += 0.28
+        if ft == "bridge":
+            boost += 0.36
+        if _has_entity_prefix(ep, "arc:"):
+            boost += 0.10
+        query_arcs = _query_arc_keys(query_text, query_kind)
+        if query_arcs:
+            if _has_any_entity_key(ep, query_arcs):
+                boost += 0.22
+            elif ft == "trace" and _has_entity_prefix(ep, "arc:"):
+                boost -= 0.08
+        if is_origin_query(query_text):
+            if _has_entity_key(ep, "phase:origin"):
+                boost += 0.24
+            if _has_entity_key(ep, "role:onset") or _has_entity_key(ep, "role:avoidance"):
+                boost += 0.12
+            if _has_entity_key(ep, "role:escalation") and not _has_entity_key(ep, "phase:origin"):
+                boost -= 0.08
+        if is_trajectory_query(query_text, query_kind):
+            if ft == "bridge":
+                boost += 0.32
+            if _has_entity_key(ep, "rel:caused_by") or _has_entity_prefix(ep, "cause:"):
+                boost += 0.12
+            if (
+                _has_entity_key(ep, "rel:triggered_coping")
+                or _has_entity_key(ep, "rel:coping_response")
+                or _has_entity_prefix(ep, "coping:")
+            ):
+                boost += 0.12
+            if _has_entity_key(ep, "phase:resolution") or _has_entity_key(ep, "rel:supersedes"):
+                boost += 0.08
+        if query_kind == "temporal":
+            if _has_entity_prefix(ep, "time:") or _has_entity_key(ep, "label:temporal_event"):
+                boost += 0.14
+            if _has_entity_key(ep, "role:onset") or _has_entity_key(ep, "role:outcome"):
+                boost += 0.08
+        elif query_kind == "conflict":
+            if _has_entity_key(ep, "label:conflict_marker"):
+                boost += 0.16
+            if _has_entity_key(ep, "role:avoidance") or _has_entity_key(ep, "role:resolution"):
+                boost += 0.10
+        elif query_kind == "user_modeling":
+            if _has_entity_key(ep, "label:coping_strategy") or _has_entity_key(ep, "arc:mental_health_coping"):
+                boost += 0.16
+            if _has_entity_key(ep, "label:state_change") or _has_entity_key(ep, "role:state_change"):
+                boost += 0.10
     return boost
 
 
@@ -542,6 +710,9 @@ def _empty_stats() -> Dict[str, int]:
         "candidates_summary": 0,
         "candidates_cues": 0,
         "candidates_entity": 0,
+        "candidates_arc": 0,
+        "candidates_origin": 0,
+        "candidates_trajectory": 0,
         "candidates_after_rrf": 0,
         "cross_encoder_enabled": 0,
         "strong_rerank_enabled": 0,
@@ -569,6 +740,7 @@ def hybrid_retrieve(conn, query_text: str, query_embedding: List[float],
         else config.HYBRID_AFTER_RRF_K
 
     stats = _empty_stats()
+    query_kind = query_kind or classify_query(query_text)
 
     # ----- (a) semantic kNN over fact embeddings ---------------------------
     semantic = _store.fact_knn_candidates(conn, query_embedding,
@@ -594,11 +766,36 @@ def hybrid_retrieve(conn, query_text: str, query_embedding: List[float],
                    if entities else [])
     stats["candidates_entity"] = len(entity_hits)
 
+    arc_hits: List[Episode] = []
+    origin_hits: List[Episode] = []
+    trajectory_hits: List[Episode] = []
+    if query_kind in ("temporal", "conflict", "user_modeling"):
+        arc_keys = _arc_query_entity_keys(query_text, query_kind)
+        arc_hits = (_store.fact_entity_overlap(
+            conn, arc_keys, k=per_retriever_k, user_id=user_id)
+            if arc_keys else [])
+        if is_origin_query(query_text):
+            origin_hits = (_store.fact_arc_origin_search(
+                conn, arc_keys, k=per_retriever_k, user_id=user_id)
+                if arc_keys else [])
+        if is_trajectory_query(query_text, query_kind):
+            trajectory_hits = (_store.fact_trajectory_search(
+                conn, arc_keys, k=per_retriever_k, user_id=user_id)
+                if arc_keys else [])
+    stats["candidates_arc"] = len(arc_hits)
+    stats["candidates_origin"] = len(origin_hits)
+    stats["candidates_trajectory"] = len(trajectory_hits)
+
     # ----- RRF fusion -----------------------------------------------------
     # Order matters: semantic first so the cosine ``similarity`` field
     # survives dedup (we use it in the final R(m) tilt).
-    fused = _rerank.rrf_fuse([semantic, summary_hits, cue_hits, entity_hits],
-                              k=config.HYBRID_RRF_K)[:after_rrf_k]
+    fused = _rerank.rrf_fuse(
+        [
+            semantic, summary_hits, cue_hits, entity_hits,
+            arc_hits, origin_hits, trajectory_hits,
+        ],
+        k=config.HYBRID_RRF_K,
+    )[:after_rrf_k]
     stats["candidates_after_rrf"] = len(fused)
 
     # ----- Optional cross-encoder rerank ----------------------------------
@@ -612,9 +809,13 @@ def hybrid_retrieve(conn, query_text: str, query_embedding: List[float],
         stats["strong_rerank_enabled"] = 1
 
     # ----- Final state-modulated R(m) tilt + isolation assert -------------
-    final = rerank(fused, state, top_k=top_k)
+    # In adaptive mode, query-kind boosts need to see the fused candidate pool.
+    # Truncating to TOP_K before those boosts can discard exactly the trace that
+    # a temporal/conflict/user-modeling query is asking for.
+    rerank_k = after_rrf_k if config.RECALL_POLICY == "adaptive" else top_k
+    final = rerank(fused, state, top_k=rerank_k)
     if config.RECALL_POLICY == "adaptive":
         final = select_sparse_recall(
-            final, state, query_kind or classify_query(query_text), query_text)
+            final, state, query_kind, query_text)
     _rerank.assert_user_isolation(final, user_id)
     return final, stats

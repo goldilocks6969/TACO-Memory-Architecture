@@ -4,3 +4,4 @@ openai>=1.30
 numpy>=1.24
 python-dotenv>=1.0
 tiktoken>=0.7
+mem0ai>=2.0.0; python_version >= "3.10"

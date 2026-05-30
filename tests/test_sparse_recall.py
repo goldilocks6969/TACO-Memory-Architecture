@@ -19,6 +19,14 @@ def test_query_classification_examples():
     assert retrieval.classify_query("am I making any progress health-wise?") == "coherence"
     assert retrieval.classify_query(
         "what did I ask you to recommend in our first chat?") == "filler"
+    assert retrieval.classify_query(
+        "what happened first before I started therapy?") == "temporal"
+    assert retrieval.classify_query(
+        "did my response to the workplace conflict change?") == "conflict"
+    assert retrieval.classify_query(
+        "did I address the harassment issue when it first started?") == "conflict"
+    assert retrieval.classify_query(
+        "how has my coping approach evolved?") == "user_modeling"
 
 
 def test_filler_retrieves_nothing_by_default(monkeypatch):
@@ -73,6 +81,61 @@ def test_coherence_keeps_outcome_and_origin(monkeypatch):
     contents = [m.content for m in top]
     assert "User got hired at Halcyon." in contents
     assert "User was laid off from Nimbus." in contents
+
+
+def test_arc_trace_boost_for_conflict_queries(monkeypatch):
+    monkeypatch.setattr(config, "RECALL_POLICY", "adaptive")
+    monkeypatch.setattr(config, "RECALL_COHERENCE_K", 2)
+    trace = _ep("Trace [work_career / avoidance]: User initially ignored workplace harassment.",
+                salience=7, score=0.55)
+    trace.fact_type = "trace"
+    trace.event_type = "work_career"
+    trace.entity_keys = ["arc:work_career", "role:avoidance", "label:conflict_marker"]
+    ordinary = _ep("User had a difficult day at work.", salience=6, score=0.58)
+    top = retrieval.select_sparse_recall(
+        [ordinary, trace], LatentState(), "conflict",
+        "did I initially address the workplace conflict?")
+    assert "work_career / avoidance" in top[0].content
+
+
+def test_arc_trace_prefers_query_domain(monkeypatch):
+    monkeypatch.setattr(config, "RECALL_POLICY", "adaptive")
+    monkeypatch.setattr(config, "RECALL_COHERENCE_K", 2)
+    work = _ep("Trace [work_career / avoidance]: User did not address workplace harassment.",
+               salience=7, score=0.50)
+    work.fact_type = "trace"
+    work.entity_keys = [
+        "arc:work_career", "role:avoidance", "phase:origin", "label:conflict_marker"
+    ]
+    generic = _ep("Trace [relationships / avoidance]: User avoided an old pattern.",
+                  salience=7, score=0.58)
+    generic.fact_type = "trace"
+    generic.entity_keys = ["arc:relationships", "role:avoidance", "label:conflict_marker"]
+    top = retrieval.select_sparse_recall(
+        [generic, work], LatentState(), "conflict",
+        "did I address the harassment issue when it first started?")
+    assert "work_career / avoidance" in top[0].content
+
+
+def test_origin_query_prefers_arc_origin_over_later_escalation(monkeypatch):
+    monkeypatch.setattr(config, "RECALL_POLICY", "adaptive")
+    monkeypatch.setattr(config, "RECALL_COHERENCE_K", 2)
+    origin = _ep("Trace [work_career / avoidance / origin]: User did not address workplace harassment.",
+                 salience=7, score=0.45)
+    origin.fact_type = "trace"
+    origin.entity_keys = [
+        "arc:work_career", "role:avoidance", "phase:origin", "label:conflict_marker"
+    ]
+    later = _ep("Trace [work_career / escalation / transition]: Work tension escalated later.",
+                salience=8, score=0.62)
+    later.fact_type = "trace"
+    later.entity_keys = [
+        "arc:work_career", "role:escalation", "phase:transition", "label:conflict_marker"
+    ]
+    top = retrieval.select_sparse_recall(
+        [later, origin], LatentState(), "conflict",
+        "did I address the harassment issue when it first started?")
+    assert top[0].content.startswith("Trace [work_career / avoidance / origin]")
 
 
 def test_redundancy_collapse_prefers_short_anchor():

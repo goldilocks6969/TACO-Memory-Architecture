@@ -28,7 +28,7 @@ from .memory import (decay, extract, identity, operations, reconsolidation,
                      retrieval, salience, store)
 from .memory.episode import Episode
 from .retry import CallTimeout
-from .state import LatentState
+from .state import ContentSignal, LatentState, infer_state
 from .subsystems import orchestrator, prediction
 from .subsystems.orchestrator import CognitivePlan
 from .subsystems.prediction import PredictiveContinuity
@@ -44,6 +44,7 @@ def _new_extraction_stats() -> Dict[str, int]:
         "full_extract_timeouts": 0,
         "full_extract_failures": 0,
         "full_extract_fallbacks": 0,
+        "bridge_facts_created": 0,
     }
 
 
@@ -92,6 +93,9 @@ class Taco:
             "candidates_summary": 0,
             "candidates_cues": 0,
             "candidates_entity": 0,
+            "candidates_arc": 0,
+            "candidates_origin": 0,
+            "candidates_trajectory": 0,
             "candidates_after_rrf": 0,
             "cross_encoder_calls": 0,
             "strong_rerank_calls": 0,
@@ -286,9 +290,41 @@ class Taco:
                                  self.state, user_id=self.user_id)
             ids.append(fid)
             self.extraction_stats["light_facts_created"] += 1
+            bridge_id = self._maybe_store_bridge_fact(fact, source_episode_id)
+            if bridge_id is not None:
+                ids.append(bridge_id)
         if ids:
             print(f"[extract] {len(ids)} light fact(s) created", flush=True)
         return ids
+
+    @staticmethod
+    def _bridge_signature(fact: "extract.Fact") -> set:
+        return {
+            key for key in (fact.entity_keys or [])
+            if key.startswith("cause:")
+            or key.startswith("coping:")
+        }
+
+    def _maybe_store_bridge_fact(self, current_fact,
+                                 source_episode_id: Optional[int]) -> Optional[int]:
+        recent = store.recent_trace_facts(self.conn, user_id=self.user_id)
+        bridge = extract.bridge_fact(current_fact, recent)
+        if bridge is None:
+            return None
+        sig = self._bridge_signature(bridge)
+        if not sig:
+            return None
+        for fact in recent:
+            if fact.fact_type != "bridge":
+                continue
+            existing = self._bridge_signature(fact)
+            if sig <= existing or existing <= sig:
+                return None
+        f_emb = embeddings.embed_list(bridge.summary)
+        fid = store.add_fact(self.conn, bridge, f_emb, source_episode_id,
+                             self.state, user_id=self.user_id)
+        self.extraction_stats["bridge_facts_created"] += 1
+        return fid
 
     def _apply_full_facts(self, full: "extract.FullExtract",
                           source_episode_id: Optional[int]) -> None:
@@ -375,6 +411,8 @@ class Taco:
         s["retrieval_calls"] += 1
         for key in ("candidates_semantic", "candidates_summary",
                     "candidates_cues", "candidates_entity",
+                    "candidates_arc", "candidates_origin",
+                    "candidates_trajectory",
                     "candidates_after_rrf"):
             s[key] += hstats.get(key, 0)
         if hstats.get("cross_encoder_enabled"):

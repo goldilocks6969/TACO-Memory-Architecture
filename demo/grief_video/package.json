@@ -1,0 +1,33 @@
+{
+  "name": "taco-grief-demo-video",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "remotion studio src/index.ts",
+    "render": "remotion render src/index.ts TACOGriefDemo out/taco-grief-demo.mp4 --codec=h264 --pixel-format=yuv420p",
+    "still:title": "remotion still src/index.ts TACOGriefDemo out/checkpoint-00-title.png --frame=0",
+    "still:disclosure": "remotion still src/index.ts TACOGriefDemo out/checkpoint-12-disclosure.png --frame=360",
+    "still:probe": "remotion still src/index.ts TACOGriefDemo out/checkpoint-32-probe.png --frame=960",
+    "still:rag": "remotion still src/index.ts TACOGriefDemo out/checkpoint-44-rag.png --frame=1320",
+    "still:taco": "remotion still src/index.ts TACOGriefDemo out/checkpoint-55-taco.png --frame=1650",
+    "still:close": "remotion still src/index.ts TACOGriefDemo out/checkpoint-64-close.png --frame=1920",
+    "still:all": "npm run still:title && npm run still:disclosure && npm run still:probe && npm run still:rag && npm run still:taco && npm run still:close",
+    "sfx": "node scripts/generate-sfx.mjs",
+    "music": "node scripts/generate-music-bed.mjs",
+    "voiceover": "node scripts/generate-voiceover.mjs",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@remotion/cli": "^4.0.357",
+    "@remotion/google-fonts": "^4.0.357",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1",
+    "remotion": "^4.0.357"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^5.9.3"
+  }
+}

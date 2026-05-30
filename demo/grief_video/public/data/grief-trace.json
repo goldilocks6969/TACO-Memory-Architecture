@@ -1,0 +1,141 @@
+{
+  "title": "TACO Memory Architecture",
+  "subtitle": "When semantic search misses what matters.",
+  "thesis": "Memory is not retrieval. Memory is valuation.",
+  "sessions": [
+    {
+      "label": "Session 1",
+      "gap": "Day 0",
+      "message": "My dad passed away last night. A heart attack. I can't believe it.",
+      "state": {
+        "E": 80,
+        "K": 42,
+        "V": 90,
+        "R": 100
+      },
+      "stored_memory": "The user's father died suddenly of a heart attack.",
+      "salience": 10,
+      "tone": "distress"
+    },
+    {
+      "label": "Session 2",
+      "gap": "+3 days",
+      "message": "what time does the post office close on fridays?",
+      "salience": 2,
+      "tone": "transactional"
+    },
+    {
+      "label": "Session 3",
+      "gap": "+1 week",
+      "message": "thanks for the pasta recipe. it turned out great.",
+      "salience": 1.5,
+      "tone": "neutral"
+    },
+    {
+      "label": "Session 4",
+      "gap": "+3 weeks",
+      "message": "work was normal today. everyone is still tiptoeing around me.",
+      "salience": 4,
+      "tone": "concerned"
+    }
+  ],
+  "probe": "I saw an old man at the park feeding birds and just lost it. why am I like this?",
+  "query_kind": "emotional",
+  "state": {
+    "E": 80,
+    "K": 60,
+    "V": 90,
+    "R": 100
+  },
+  "current_tone": "distress",
+  "weights": {
+    "sem": 0.28,
+    "sal": 0.24,
+    "emo": 0.361,
+    "rec": 0.08,
+    "decay": 0.04
+  },
+  "naive": {
+    "top": "The user asked about a park where older people feed birds.",
+    "label": "Matched words. Missed meaning.",
+    "reason": "Highest semantic similarity to park / old man / feeding birds."
+  },
+  "taco": {
+    "top": "The user's father died suddenly of a heart attack.",
+    "label": "Matched state. Preserved continuity.",
+    "reason": "Low lexical overlap, but high salience + distress tone match."
+  },
+  "candidates": [
+    {
+      "content": "The user's father died suddenly of a heart attack.",
+      "similarity": 0.08,
+      "salience": 10.0,
+      "tone": "distress",
+      "score": 0.879,
+      "kind": "target",
+      "lexical_overlap": 0.0
+    },
+    {
+      "content": "The user asked about a park where older people feed birds.",
+      "similarity": 0.92,
+      "salience": 2.0,
+      "tone": "neutral",
+      "score": 0.577,
+      "kind": "surface-match",
+      "lexical_overlap": 0.74
+    },
+    {
+      "content": "The user wanted a quick morning routine.",
+      "similarity": 0.36,
+      "salience": 1.5,
+      "tone": "neutral",
+      "score": 0.404,
+      "kind": "filler",
+      "lexical_overlap": 0.18
+    }
+  ],
+  "proof": {
+    "naive_top_is_surface_match": true,
+    "taco_top_is_grief_memory": true,
+    "target_semantic_similarity": 0.08,
+    "target_taco_score": 0.879,
+    "surface_match_similarity": 0.92
+  },
+  "voiceover": [
+    {
+      "start": 0,
+      "end": 5.5,
+      "text": "Semantic search finds similar words, not always what mattered."
+    },
+    {
+      "start": 5.5,
+      "end": 18.5,
+      "text": "In session one, the user discloses that their father died suddenly. TACO stores the moment because the user's state is highly vulnerable."
+    },
+    {
+      "start": 18.5,
+      "end": 28.5,
+      "text": "Weeks pass. The conversation fills with ordinary logistics, small talk, and unrelated details."
+    },
+    {
+      "start": 28.5,
+      "end": 39.5,
+      "text": "Then the user says: I saw an old man feeding birds and just lost it."
+    },
+    {
+      "start": 39.5,
+      "end": 50.5,
+      "text": "Naive RAG retrieves the closest words: park, old man, feeding birds. It misses the emotional cause."
+    },
+    {
+      "start": 50.5,
+      "end": 61.5,
+      "text": "TACO retrieves the father's death disclosure. Not because the words match, but because the state matches."
+    },
+    {
+      "start": 61.5,
+      "end": 66,
+      "text": "Memory is not retrieval. Memory is valuation."
+    }
+  ]
+}

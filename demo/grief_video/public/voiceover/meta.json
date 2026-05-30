@@ -1,0 +1,49 @@
+{
+  "exists": true,
+  "file": "voiceover/narration.mp3",
+  "cues": [
+    {
+      "file": "voiceover/cues/cue-00.mp3",
+      "start": 0,
+      "end": 5.5,
+      "sha256": "1e866392c9a36cc15687a2a9869c917694f31a6e14f9b14d07c780525cea4013"
+    },
+    {
+      "file": "voiceover/cues/cue-01.mp3",
+      "start": 5.5,
+      "end": 18.5,
+      "sha256": "a12c45e5fd8fe64e7b45e49a9737dd634e79e071099e48ce080b846262feecd8"
+    },
+    {
+      "file": "voiceover/cues/cue-02.mp3",
+      "start": 18.5,
+      "end": 28.5,
+      "sha256": "18249878b48018baf79b09140a61729fd28e769e5de10e908187a7298aa37ed7"
+    },
+    {
+      "file": "voiceover/cues/cue-03.mp3",
+      "start": 28.5,
+      "end": 39.5,
+      "sha256": "1e3823623f15a5191c49ec4e79653086dbc2d90dbf59385fde6de6f50715eab2"
+    },
+    {
+      "file": "voiceover/cues/cue-04.mp3",
+      "start": 39.5,
+      "end": 50.5,
+      "sha256": "5f4deca62946e5b6b7d9ddafcf2d141663438fbed559709f50ea062b3c8f5160"
+    },
+    {
+      "file": "voiceover/cues/cue-05.mp3",
+      "start": 50.5,
+      "end": 61.5,
+      "sha256": "2ae4bc4254f7a324d605bd4823f7115f5c3af8cab21b1e53f07861f0b01f8c8b"
+    },
+    {
+      "file": "voiceover/cues/cue-06.mp3",
+      "start": 61.5,
+      "end": 66,
+      "sha256": "ec85a5e418f221a6751d4635ec55820a7f126b0b3afd682befe3ffdcfb50792f"
+    }
+  ],
+  "sha256": "0f64ae87d372b3c6374d73a78b7acd18ae6cdbb62f6f223122ca0051431b8b11"
+}

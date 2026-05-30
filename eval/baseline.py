@@ -15,6 +15,7 @@ difference is the memory policy.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Tuple
 
@@ -26,13 +27,30 @@ from taco import embeddings, llm
 @dataclass
 class NaiveRAG:
     k: int = 5
+    min_chunk_tokens: int = 3
+    eps: float = 1e-8
     _chunks: List[str] = field(default_factory=list)
     _embs: List[np.ndarray] = field(default_factory=list)
+    dropped_chunks: int = 0
 
     def ingest_chunk(self, text: str) -> None:
         """Store one raw multi-turn chunk (no filtering)."""
+        text = text.strip()
+        if len(re.findall(r"\S+", text)) < self.min_chunk_tokens:
+            self.dropped_chunks += 1
+            return
+
+        emb = np.asarray(embeddings.embed_list(text), dtype=np.float64)
+        if not np.all(np.isfinite(emb)):
+            self.dropped_chunks += 1
+            return
+        norm = float(np.linalg.norm(emb))
+        if norm <= self.eps:
+            self.dropped_chunks += 1
+            return
+
         self._chunks.append(text)
-        self._embs.append(np.asarray(embeddings.embed_list(text), dtype=np.float32))
+        self._embs.append(emb / norm)
 
     def corpus_tokens(self, ntok: Callable[[str], int]) -> int:
         return sum(ntok(c) for c in self._chunks)
@@ -40,9 +58,24 @@ class NaiveRAG:
     def retrieve(self, query: str) -> List[str]:
         if not self._chunks:
             return []
-        q = np.asarray(embeddings.embed_list(query), dtype=np.float32)
+        q = np.asarray(embeddings.embed_list(query), dtype=np.float64)
+        q_norm = float(np.linalg.norm(q))
+        if not np.all(np.isfinite(q)) or q_norm <= self.eps:
+            raise RuntimeError(
+                "NaiveRAG received a non-finite or zero-norm query embedding"
+            )
+        q = q / q_norm
         mat = np.vstack(self._embs)
-        sims = mat @ q / (np.linalg.norm(mat, axis=1) * np.linalg.norm(q) + 1e-12)
+        with np.errstate(divide="raise", invalid="raise", over="raise"):
+            try:
+                sims = np.einsum("ij,j->i", mat, q, optimize=False)
+            except FloatingPointError as exc:
+                raise RuntimeError(
+                    "NaiveRAG similarity produced a floating-point error; "
+                    "check chunk embedding norms and finite values"
+                ) from exc
+        if not np.all(np.isfinite(sims)):
+            raise RuntimeError("NaiveRAG similarity produced non-finite scores")
         idx = np.argsort(-sims)[: self.k]
         return [self._chunks[i] for i in idx]
 

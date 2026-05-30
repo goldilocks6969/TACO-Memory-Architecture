@@ -169,13 +169,41 @@ def fact_neighbors(conn: psycopg.Connection, embedding: List[float],
     return out
 
 
+def recent_trace_facts(conn: psycopg.Connection, limit: int = 80,
+                       user_id: str = DEFAULT_USER_ID) -> List[Fact]:
+    """Recent trace/bridge facts with metadata for write-time consolidation."""
+    rows = conn.execute(
+        """
+        SELECT id, user_id, summary, fact_type, event_type, emotional_tone,
+               salience, retrieval_cues, entity_keys, validity, confidence,
+               created_at
+        FROM facts
+        WHERE user_id = %s
+              AND validity = 'current'
+              AND fact_type IN ('trace', 'bridge')
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s
+        """,
+        (user_id, limit),
+    ).fetchall()
+    out: List[Fact] = []
+    for r in rows:
+        out.append(Fact(
+            id=r[0], user_id=r[1], summary=r[2], fact_type=r[3],
+            event_type=r[4], emotional_tone=r[5], salience=float(r[6]),
+            retrieval_cues=list(r[7] or []), entity_keys=list(r[8] or []),
+            validity=r[9], confidence=float(r[10]), created_at=r[11],
+        ))
+    return list(reversed(out))
+
+
 def _fact_row_to_episode(r) -> Episode:
     """Adapt a fact row into an Episode so the existing reranker/briefing (which
     are episode-shaped) can consume facts unchanged in Phase 1.
 
     Row shape: (id, user_id, summary, salience, vitality, tone, created_at,
                 similarity[, fact_type, event_type, thread_status,
-                retrieval_cues]).
+                retrieval_cues, entity_keys]).
     """
     ep = Episode(
         id=r[0], user_id=r[1], role="memory", content=r[2],
@@ -187,6 +215,7 @@ def _fact_row_to_episode(r) -> Episode:
         ep.event_type = r[9]
         ep.thread_status = r[10]
         ep.retrieval_cues = list(r[11] or [])
+        ep.entity_keys = list(r[12] or []) if len(r) > 12 else []
     return ep
 
 
@@ -202,7 +231,7 @@ def fact_knn_candidates(conn: psycopg.Connection, query_embedding: List[float],
         f"""
         SELECT id, user_id, summary, salience, vitality, emotional_tone, created_at,
                1 - (embedding <=> %s) AS similarity,
-               fact_type, event_type, thread_status, retrieval_cues
+               fact_type, event_type, thread_status, retrieval_cues, entity_keys
         FROM facts
         WHERE {where}
         ORDER BY embedding <=> %s
@@ -307,7 +336,7 @@ def fact_text_search(conn: psycopg.Connection, query_text: str, k: int = 20,
     sql = """
         SELECT id, user_id, summary, salience, vitality, emotional_tone,
                created_at, similarity(summary, %s) AS sim,
-               fact_type, event_type, thread_status, retrieval_cues
+               fact_type, event_type, thread_status, retrieval_cues, entity_keys
         FROM facts
         WHERE user_id = %s AND validity = 'current'
               AND summary %% %s
@@ -338,7 +367,7 @@ def fact_cue_search(conn: psycopg.Connection, query_text: str, k: int = 20,
     sql = """
         SELECT id, user_id, summary, salience, vitality, emotional_tone,
                created_at, similarity(COALESCE(cues_text, ''), %s) AS sim,
-               fact_type, event_type, thread_status, retrieval_cues
+               fact_type, event_type, thread_status, retrieval_cues, entity_keys
         FROM facts
         WHERE user_id = %s AND validity = 'current'
               AND cues_text IS NOT NULL
@@ -372,7 +401,7 @@ def fact_entity_overlap(conn: psycopg.Connection, entity_keys: List[str],
                created_at,
                cardinality(ARRAY(SELECT unnest(entity_keys)
                                  INTERSECT SELECT unnest(%s::text[]))) AS overlap,
-               fact_type, event_type, thread_status, retrieval_cues
+               fact_type, event_type, thread_status, retrieval_cues, entity_keys
         FROM facts
         WHERE user_id = %s AND validity = 'current'
               AND entity_keys && %s::text[]
@@ -382,6 +411,121 @@ def fact_entity_overlap(conn: psycopg.Connection, entity_keys: List[str],
     return _safe_fact_text_query(
         conn, sql, (keys, user_id, keys, k),
         label="store.fact_entity_overlap",
+    )
+
+
+def fact_arc_origin_search(conn: psycopg.Connection, entity_keys: List[str],
+                           k: int = 20,
+                           user_id: str = DEFAULT_USER_ID) -> List[Episode]:
+    """Retrieve early lifecycle traces for origin/trajectory questions.
+
+    This uses only existing trace metadata: ``phase:*``, ``role:*``, ``arc:*``
+    and ``time:YYYY-MM-DD`` entity keys. It is the temporal-boundary complement
+    to entity-overlap retrieval: when the query asks how something started, the
+    earliest matching boundary should get a chance before semantic recency wins.
+    """
+    keys = [key for key in (entity_keys or []) if key]
+    if not keys:
+        return []
+    sql = """
+        WITH candidate AS (
+            SELECT id, user_id, summary, salience, vitality, emotional_tone,
+                   created_at,
+                   cardinality(ARRAY(SELECT unnest(entity_keys)
+                                     INTERSECT SELECT unnest(%s::text[]))) AS overlap,
+                   fact_type, event_type, thread_status, retrieval_cues, entity_keys,
+                   EXISTS(SELECT 1 FROM unnest(entity_keys) k
+                          WHERE k IN ('phase:origin', 'role:avoidance', 'role:onset')) AS is_origin,
+                   (
+                       SELECT MIN(substring(k from 6)::date)
+                       FROM unnest(entity_keys) k
+                       WHERE k ~ '^time:[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                   ) AS event_date
+            FROM facts
+            WHERE user_id = %s
+                  AND validity = 'current'
+                  AND fact_type IN ('trace', 'bridge')
+                  AND entity_keys && %s::text[]
+        )
+        SELECT id, user_id, summary, salience, vitality, emotional_tone,
+               created_at, overlap::float / GREATEST(cardinality(%s::text[]), 1),
+               fact_type, event_type, thread_status, retrieval_cues, entity_keys
+        FROM candidate
+        ORDER BY is_origin DESC, event_date ASC NULLS LAST, overlap DESC, salience DESC
+        LIMIT %s
+    """
+    return _safe_fact_text_query(
+        conn, sql, (keys, user_id, keys, keys, k),
+        label="store.fact_arc_origin_search",
+    )
+
+
+def fact_trajectory_search(conn: psycopg.Connection, entity_keys: List[str],
+                           k: int = 20,
+                           user_id: str = DEFAULT_USER_ID) -> List[Episode]:
+    """Retrieve a compact ordered trajectory over bridge/trace facts.
+
+    Bridges are the preferred synthesized answer unit. Supporting trace facts
+    still follow as origin, causal antecedent, coping/action, and latest state.
+    This uses write-time causal/phase keys instead of asking the LLM to
+    rediscover structure from raw top-k fragments.
+    """
+    keys = [key for key in (entity_keys or []) if key]
+    if not keys:
+        return []
+    sql = """
+        WITH candidate AS (
+            SELECT id, user_id, summary, salience, vitality, emotional_tone,
+                   created_at,
+                   cardinality(ARRAY(SELECT unnest(entity_keys)
+                                     INTERSECT SELECT unnest(%s::text[]))) AS overlap,
+                   fact_type, event_type, thread_status, retrieval_cues, entity_keys,
+                   fact_type = 'bridge' AS is_bridge,
+                   EXISTS(SELECT 1 FROM unnest(entity_keys) k
+                          WHERE k = 'phase:origin') AS is_origin,
+                   EXISTS(SELECT 1 FROM unnest(entity_keys) k
+                          WHERE k LIKE 'cause:%%' OR k = 'rel:caused_by') AS is_cause,
+                   EXISTS(SELECT 1 FROM unnest(entity_keys) k
+                          WHERE k LIKE 'coping:%%'
+                                OR k IN ('rel:triggered_coping', 'rel:coping_response')) AS is_coping,
+                   EXISTS(SELECT 1 FROM unnest(entity_keys) k
+                          WHERE k IN ('phase:resolution', 'role:outcome',
+                                      'role:resolution', 'rel:supersedes')) AS is_resolution,
+                   (
+                       SELECT MIN(substring(k from 6)::date)
+                       FROM unnest(entity_keys) k
+                       WHERE k ~ '^time:[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                   ) AS event_date
+            FROM facts
+            WHERE user_id = %s
+                  AND validity = 'current'
+                  AND fact_type IN ('bridge', 'trace')
+                  AND entity_keys && %s::text[]
+        ),
+        ranked AS (
+            SELECT *,
+                   CASE
+                       WHEN is_bridge THEN 0
+                       WHEN is_origin THEN 1
+                       WHEN is_cause THEN 2
+                       WHEN is_coping THEN 3
+                       WHEN is_resolution THEN 4
+                       ELSE 5
+                   END AS chain_rank
+            FROM candidate
+        )
+        SELECT id, user_id, summary, salience, vitality, emotional_tone,
+               created_at,
+               (1.0 - chain_rank * 0.12)
+                   + overlap::float / GREATEST(cardinality(%s::text[]), 1),
+               fact_type, event_type, thread_status, retrieval_cues, entity_keys
+        FROM ranked
+        ORDER BY chain_rank ASC, event_date ASC NULLS LAST, overlap DESC, salience DESC
+        LIMIT %s
+    """
+    return _safe_fact_text_query(
+        conn, sql, (keys, user_id, keys, keys, k),
+        label="store.fact_trajectory_search",
     )
 
 
